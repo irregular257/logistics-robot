@@ -1,0 +1,663 @@
+#pragma once
+#include <Arduino.h>
+
+static const char WEB_PAGE[] PROGMEM = R"HTML(<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#101b2c">
+<title>小车控制</title>
+<style>
+:root{color-scheme:dark;--bg:#101b2c;--panel:#19263a;--line:#344359;--text:#f4f7fc;--muted:#aab9cd;--blue:#77b5ff;--danger:#ec575b;--green:#73d4ad}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px/1.5 system-ui,-apple-system,"Microsoft YaHei",sans-serif}main{max-width:680px;margin:auto;padding:22px 16px calc(24px + env(safe-area-inset-bottom))}h1{font-size:25px;line-height:1.25;margin:0 0 6px}h2{font-size:18px;margin:0 0 14px}p{margin:0}.intro,.hint{color:var(--muted);font-size:14px}.panel{margin-top:16px;padding:18px;background:var(--panel);border:1px solid var(--line);border-radius:18px}.topline{display:flex;align-items:center;justify-content:space-between;gap:12px}.badge{font-size:12px;color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:4px 10px;white-space:nowrap}.status{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:14px}.status div{padding:10px 12px;background:var(--bg);border-radius:10px}.status small{display:block;font-size:12px;color:var(--muted)}.status strong{font-size:14px;font-weight:600}.good{color:var(--green)}.bad{color:#ff9396}.notice{min-height:46px;margin-top:12px;padding:10px 12px;background:#111d30;border-left:3px solid var(--blue);border-radius:6px;font-size:14px;overflow-wrap:anywhere}.notice.error{border-left-color:var(--danger);color:#ffb7b9}.controls{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}button,input,select{font:inherit}button{border:1px solid var(--line);border-radius:11px;background:#25364f;color:var(--text);padding:13px 15px;min-height:48px;cursor:pointer;touch-action:manipulation}button:disabled{opacity:.38;cursor:not-allowed}button:focus-visible,input:focus-visible,select:focus-visible{outline:3px solid var(--blue);outline-offset:2px}.primary{background:#2d64a4;border-color:#4d85c6}.stop{display:block;width:100%;margin-top:12px;background:#b52d35;border-color:#e05a61;font-size:21px;font-weight:700;min-height:62px}.stop:active{background:#e24750}.speed{display:flex;align-items:center;gap:12px;margin-bottom:16px}.speed label{white-space:nowrap;color:var(--muted);font-size:14px}.speed input{min-width:0;width:100%;accent-color:var(--blue)}.speed output{min-width:42px;text-align:right;font-variant-numeric:tabular-nums}.drive{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px}.hold{min-height:70px;font-weight:600;touch-action:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}.hold.pressed{background:#3279c3;border-color:#b5d7ff;box-shadow:0 0 0 2px #77b5ff}.center{display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:13px;border:1px dashed var(--line);border-radius:11px;text-align:center}.row{display:grid;grid-template-columns:1fr 1fr;gap:9px}.row .hold{min-height:55px}.section-hint{margin-top:12px;color:var(--muted);font-size:13px}.subheading{font-size:15px;margin:20px 0 9px}.form{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.form label{font-size:13px;color:var(--muted)}.form input,.form select{width:100%;margin-top:6px;border:1px solid var(--line);border-radius:8px;padding:10px 8px;background:#101b2c;color:var(--text);min-height:45px}.save{margin-top:14px;width:100%}.ack{font-size:12px;color:var(--muted);margin-top:10px}footer{font-size:12px;color:var(--muted);margin-top:18px;text-align:center}@media(max-width:370px){main{padding-left:10px;padding-right:10px}.panel{padding:14px}.controls button{padding-left:10px;padding-right:10px}.form{gap:6px}}
+</style>
+</head>
+<body>
+<main>
+  <div class="topline"><div><h1>小车控制</h1><p class="intro">连接设备热点后访问 192.168.4.1</p></div><span class="badge" id="connection">连接中</span></div>
+  <section class="panel" aria-label="设备与控制状态">
+    <div class="status">
+      <div><small>当前模式</small><strong id="mode">检查中</strong></div>
+      <div><small>控制权限</small><strong id="owner">未申请</strong></div>
+      <div><small>运动状态</small><strong id="armed">未启用</strong></div>
+      <div><small>设备故障</small><strong id="fault">检查中</strong></div>
+    </div>
+    <div id="notice" class="notice" role="status" aria-live="polite">先申请控制，再选择手动或自动搬运。手动按住方向按钮移动，松手停止。</div>
+    <div class="controls">
+      <button id="claim" class="primary" type="button">申请控制</button>
+      <button id="manual" type="button" disabled>启用手动</button>
+      <button id="release" type="button" disabled>退出控制</button>
+    </div>
+    <button id="stop" class="stop" type="button">停止控制</button>
+    <p class="section-hint">停止底盘、升降和自动任务；舵机保持最后下发的目标角度。</p>
+    <p class="ack" id="ack">等待设备状态</p>
+  </section>
+  <section class="panel" aria-label="底盘与夹爪">
+    <h2>底盘控制</h2>
+    <div class="speed"><label for="speed">速度</label><input id="speed" type="range" min="10" max="50" step="1" value="20"><output id="speedValue" for="speed">20%</output></div>
+    <div class="drive">
+      <button class="hold" type="button" data-motion="turnLeft" disabled>↶ 左转</button>
+      <button class="hold" type="button" data-motion="forward" disabled>↑ 前进</button>
+      <button class="hold" type="button" data-motion="turnRight" disabled>右转 ↷</button>
+      <button class="hold" type="button" data-motion="left" disabled>← 左移</button>
+      <div class="center">按住移动<br>松手停止</div>
+      <button class="hold" type="button" data-motion="right" disabled>右移 →</button>
+      <div></div><button class="hold" type="button" data-motion="backward" disabled>↓ 后退</button><div></div>
+    </div>
+    <p class="section-hint">一次只支持一个方向。离开页面或连接中断后，需要重新申请控制。</p>
+    <h3 class="subheading">夹爪 <span class="hint" id="clawState">· 目标未知</span></h3>
+    <div class="row"><button id="clawClose" type="button" disabled>闭合目标</button><button id="clawOpen" type="button" disabled>张开目标</button></div>
+    <div class="speed" style="margin-top:14px"><label for="clawAngle">试调角度</label><input id="clawAngle" type="range" min="0" max="270" step="1" value="10" disabled><output id="clawValue" for="clawAngle">10°</output></div>
+    <button id="clawApply" class="save" type="button" disabled>夹爪转到所选角度</button>
+    <div class="controls"><button id="clawSetClose" type="button" disabled>设为闭合角度</button><button id="clawSetOpen" type="button" disabled>设为张开角度</button></div>
+    <p class="section-hint" id="clawHint" role="status" aria-live="polite">请先申请控制。</p>
+    <p class="section-hint">先小幅试调，找到夹爪真正张开和闭合的角度，再保存为目标。拖动滑块不会直接动作。</p>
+    <h3 class="subheading">云台旋转 <span class="hint" id="gimbalState">· 等待主控状态</span></h3>
+    <div class="speed"><label for="gimbalAngle">选定角度</label><input id="gimbalAngle" type="range" min="0" max="270" step="1" value="54" disabled><output id="gimbalValue" for="gimbalAngle">54°</output></div>
+    <button id="gimbalApply" class="save" type="button" disabled>转到所选角度</button>
+    <div class="controls"><button id="gimbalRetract" type="button" disabled>收回 · 54°</button><button id="gimbalExtend" type="button" disabled>伸出 · 170°</button></div>
+    <div class="controls"><button id="gimbalSetRetract" type="button" disabled>设为收回角度</button><button id="gimbalSetExtend" type="button" disabled>设为伸出角度</button></div>
+    <p class="section-hint" id="presetHint" role="status" aria-live="polite">等待主控预设角度。</p>
+    <p class="section-hint" id="gimbalHint" role="status" aria-live="polite">请先申请控制。</p>
+    <p class="section-hint">270° 舵机可在 0°～270° 内选角度，实际可用范围取决于机构。上方为主控目标角度，非实测位置；自动任务中不可手动旋转。</p>
+    <h3 class="subheading">料盘旋转 <span class="hint" id="trayState">· 等待主控状态</span></h3>
+    <div class="speed"><label for="trayAngle">选定角度</label><input id="trayAngle" type="range" min="0" max="270" step="1" value="120" disabled><output id="trayValue" for="trayAngle">120°</output></div>
+    <div class="controls"><button id="trayMinus" type="button" disabled>减 5°</button><button id="trayPlus" type="button" disabled>加 5°</button></div>
+    <button id="trayApply" class="save" type="button" disabled>转盘转到所选角度</button>
+    <p class="section-hint" id="trayHint" role="status" aria-live="polite">请先申请控制。</p>
+    <p class="section-hint">拖动滑块或加减按钮只改变选定角度，点击旋转按钮才动作。转盘角度独立于云台；此处试调不会修改自动搬运的三个槽位角度。</p>
+    <h3 class="subheading">升降 <span class="hint" id="liftState">· 等待主控状态</span></h3>
+    <div class="row"><button class="hold" type="button" data-motion="liftUp" disabled>↑ 上升</button><button class="hold" type="button" data-motion="liftDown" disabled>↓ 下降</button></div>
+    <p class="section-hint">每次按压最多移动 5 毫米，松开后再按才继续；松手立即停止。到达机械端点前停止，底盘和升降不能同时运动。</p>
+  </section>
+  <section class="panel" aria-label="任务参数">
+    <h2>抓取顺序</h2>
+    <p class="section-hint">依次设置三件物料的颜色和形状。每次只抓取两项都匹配的物料，装齐三件后按下列位置投放。</p>
+    <h3 class="subheading">第一件 · 左上投放区</h3>
+    <div class="form" style="grid-template-columns:1fr 1fr">
+      <label for="color1">颜色<select id="color1"><option value="1">红色</option><option value="2">绿色</option><option value="7">黄色</option><option value="3">蓝色</option><option value="4" selected>黑色</option></select></label>
+      <label for="shape1">形状<select id="shape1"><option value="1">六棱柱</option><option value="3">圆柱</option><option value="4">五棱柱</option><option value="5">长方体</option><option value="6">奶娃</option></select></label>
+    </div>
+    <h3 class="subheading">第二件 · 右上投放区</h3>
+    <div class="form" style="grid-template-columns:1fr 1fr">
+      <label for="color2">颜色<select id="color2"><option value="1">红色</option><option value="2">绿色</option><option value="7">黄色</option><option value="3">蓝色</option><option value="4" selected>黑色</option></select></label>
+      <label for="shape2">形状<select id="shape2"><option value="1">六棱柱</option><option value="3">圆柱</option><option value="4">五棱柱</option><option value="5">长方体</option><option value="6">奶娃</option></select></label>
+    </div>
+    <h3 class="subheading">第三件 · 右下投放区</h3>
+    <div class="form" style="grid-template-columns:1fr 1fr">
+      <label for="color3">颜色<select id="color3"><option value="1">红色</option><option value="2">绿色</option><option value="7">黄色</option><option value="3">蓝色</option><option value="4" selected>黑色</option></select></label>
+      <label for="shape3">形状<select id="shape3"><option value="1">六棱柱</option><option value="3">圆柱</option><option value="4">五棱柱</option><option value="5">长方体</option><option value="6">奶娃</option></select></label>
+    </div>
+    <button id="save" class="save" type="button" disabled>发送抓取顺序</button>
+    <p class="section-hint" id="taskStatus" role="status" aria-live="polite">请设置三件物料并发送，主控确认后才能启动。</p>
+  </section>
+  <section class="panel" aria-label="自动搬运">
+    <h2>200 × 200 cm 自动搬运</h2>
+    <p class="section-hint">左下依次抓取三件，装入转盘三个储料槽 → 左上投放第一件 → 右上投放第二件 → 右下投放第三件 → 返回起点。三件装齐后再出发。</p>
+    <p class="section-hint">启动前：车中心在 (30,30) cm，车头朝场地上方，升降在已标定的搬运高度。停止后需重新摆放和恢复升降高度。</p>
+    <label class="section-hint" style="display:block"><input id="positioned" type="checkbox"> 已确认起点、方向和搬运高度</label>
+    <div class="controls"><button id="autoStart" class="primary" type="button" disabled>启动三件搬运</button><button id="autoCancel" type="button" disabled>停止自动任务</button></div>
+    <p class="section-hint" id="autoStatus" role="status" aria-live="polite">等待自动任务状态</p>
+  </section>
+  <footer>停止按钮始终可用。刷新页面后不会恢复控制或运动。</footer>
+</main>
+<script>
+'use strict';
+(() => {
+  const $ = id => document.getElementById(id);
+  const motionButtons = Array.from(document.querySelectorAll('[data-motion]'));
+  const motion = {
+    forward: [0, 1, 0, 0], backward: [0, -1, 0, 0],
+    left: [-1, 0, 0, 0], right: [1, 0, 0, 0],
+    turnLeft: [0, 0, 1, 0], turnRight: [0, 0, -1, 0],
+    liftUp: [0, 0, 0, 1], liftDown: [0, 0, 0, -1]
+  };
+  let token = '', epoch = 0, sequence = 0;
+  let state = null, stateTime = 0, networkError = false;
+  let claiming = false, commandBusy = false, modeRequestedAt = 0;
+  let press = null, jogFlight = null, zeroFlight = null, actuatorPending = null;
+  let pingFlight = null, statusFlight = null;
+  let taskInitialized = false, taskEdited = false, gimbalInitialized = false, gimbalEdited = false;
+  let clawInitialized = false, clawEdited = false;
+  let trayInitialized = false, trayEdited = false;
+  const controllers = new Set();
+  const taskIds = ['color1', 'shape1', 'color2', 'shape2', 'color3', 'shape3'];
+  const colorNames = {1:'红色', 2:'绿色', 7:'黄色', 3:'蓝色', 4:'黑色'};
+  const shapeNames = {1:'六棱柱', 3:'圆柱', 4:'五棱柱', 5:'长方体', 6:'奶娃'};
+  const shapeColors = {1:[4], 3:[1,2,3,4], 4:[1,2,7], 5:[1,2,7,3,4], 6:[1,2,7,3,4]};
+  const taskSelection = () => taskIds.map(id => Number($(id).value));
+  const validPlan = plan => Array.isArray(plan) && plan.length === 6 && plan.every((value, i) => Number.isInteger(value) && (i % 2 ? !!shapeNames[value] && shapeColors[value].includes(plan[i-1]) : !!colorNames[value]));
+  const taskFields = () => Object.fromEntries(taskIds.map(id => [id, $(id).value]));
+  const taskMatches = () => !!state && state.taskAccepted && validPlan(state.taskPlan) && taskSelection().every((value,i) => value === state.taskPlan[i]);
+  const planText = plan => ['第一件','第二件','第三件'].map((name,i) => name + '：' + colorNames[plan[i*2]] + shapeNames[plan[i*2+1]]).join('；');
+
+  const flag = value => value === true || value === 1 || value === '1' || value === 'online';
+  const fresh = () => state && Date.now() - stateTime < 1500 && !networkError;
+  const faulty = () => state && state.fault !== undefined && state.fault !== null && state.fault !== 0 && state.fault !== '0' && state.fault !== false && state.fault !== '';
+  const canAct = () => !!token && !document.hidden && fresh() && state.online && state.armed && state.mode === 1 && !faulty();
+  const canPress = () => canAct() && !commandBusy && !zeroFlight;
+  const stopped = () => state && state.jog.every(value => value === 0);
+  const canServo = () => canAct() && stopped() && !commandBusy && !press && !zeroFlight;
+  const canGimbal = () => canServo() && state.gimbalSupported;
+  const canTray = () => canServo() && state.traySupported;
+  const canAdjust = () => canServo() && state.servoPresetsSupported;
+  const gimbalMinimum = () => state && state.servoPresetsSupported ? 0 : 54;
+  const gimbalMaximum = () => state && state.servoPresetsSupported ? 270 : 229;
+  const validAngle = value => value !== null && value !== undefined && String(value).trim() !== '' && Number.isInteger(Number(value)) && Number(value) >= 0 && Number(value) <= 270;
+  const faultMessages = {8:'升降反馈超时或没有初始反馈，请检查轴 5 驱动器串口。',9:'升降没有进展，已停止，请检查机构是否卡滞。',10:'本次升降达到时限，已停止。请松开按钮，再重新申请控制。'};
+
+  function servoDisabledReason(gimbal = false, tray = false) {
+    if (!fresh() || !state.online) return '等待主控连接。';
+    if (faulty()) return '设备有故障，请先检查。';
+    if (!token) return '请先申请控制。';
+    if (document.hidden) return '页面在后台，暂不可操作。';
+    if (state.mode === 2) return '自动搬运中，暂不可手动操作。';
+    if (state.pending || modeRequestedAt) return '等待手动模式确认。';
+    if (!state.armed || state.mode !== 1) return '请先启用手动。';
+    if (press) return '请先松开方向按钮。';
+    if (zeroFlight || !stopped()) return '等待小车停止。';
+    if (actuatorPending) return '等待' + actuatorPending.name + '指令确认。';
+    if (commandBusy) return '等待当前操作完成。';
+    if (gimbal && !state.gimbalSupported) return '主控暂不支持云台，请更新固件。';
+    if (tray && !state.traySupported) return '主控暂不支持转盘，请同时更新 STM32 和 ESP32 固件。';
+    return '';
+  }
+
+  function notice(message, error = false) {
+    $('notice').textContent = message;
+    $('notice').classList.toggle('error', error);
+  }
+
+  function render() {
+    const available = fresh();
+    $('connection').textContent = !available ? (networkError ? '连接中断' : '连接中') : (state.online ? '主控在线' : '主控离线');
+    $('connection').classList.toggle('good', !!available && state.online);
+    $('connection').classList.toggle('bad', networkError || !!available && !state.online);
+    $('mode').textContent = available ? (state.mode === 2 ? '自动搬运' : state.mode === 1 ? '手动' : '待机') : '状态未知';
+    $('owner').textContent = token ? '当前页面持有' : (available && state.claimed ? '已有操作者' : '未申请');
+    $('armed').textContent = available && state.mode===2 ? '自动任务运行中' : canAct() ? '可以操作' : '未启用';
+    $('armed').classList.toggle('good', canAct());
+    const faultNames = {8:'升降反馈超时或未收到初始反馈', 9:'升降无进展，请检查卡滞', 10:'本次升降已达时限，请松手后重新申请'};
+    const recentFault = available && state.lastFault && state.lastFaultAgeMs >= 0 && state.lastFaultAgeMs < 10000;
+    $('fault').textContent = available ? (faulty() ? (faultNames[state.fault] || '故障 ' + String(state.fault)) : recentFault ? '最近：' + (faultNames[state.lastFault] || '故障 ' + String(state.lastFault)) : '无') : '状态未知';
+    $('fault').classList.toggle('bad', !!available && faulty());
+    $('clawState').textContent = '· ' + (available && state.claw === 0 ? '闭合目标' : available && state.claw === 1 ? '张开目标' : '目标未知') + (available && state.clawAngle >= 0 ? ' · ' + state.clawAngle + '°' : '');
+    $('gimbalState').textContent = !available ? '· 等待主控状态' : !state.gimbalSupported ? '· 需更新主控固件' : state.gimbalAngle < 0 ? '· 目标角度未知' : '· 目标角度 ' + state.gimbalAngle + '°';
+    $('trayState').textContent = !available ? '· 等待主控状态' : !state.traySupported ? '· 需更新主控固件' : state.trayAngle < 0 ? '· 目标角度未知' : '· 目标角度 ' + state.trayAngle + '°';
+    ['gimbalAngle', 'gimbalApply', 'gimbalRetract', 'gimbalExtend'].forEach(id => $(id).disabled = !canGimbal());
+    ['trayAngle', 'trayApply', 'trayMinus', 'trayPlus'].forEach(id => $(id).disabled = !canTray());
+    ['clawAngle', 'clawApply', 'clawSetClose', 'clawSetOpen', 'gimbalSetRetract', 'gimbalSetExtend'].forEach(id => $(id).disabled = !canAdjust());
+    $('gimbalAngle').min = String(gimbalMinimum()); $('gimbalAngle').max = String(gimbalMaximum());
+    const presets = available && state.servoPresetsSupported ? state.presets : null;
+    $('clawClose').textContent = '闭合目标' + (presets ? ' · ' + presets.clawClose + '°' : '');
+    $('clawOpen').textContent = '张开目标' + (presets ? ' · ' + presets.clawOpen + '°' : '');
+    $('gimbalRetract').textContent = '收回 · ' + (presets ? presets.gimbalIn : 54) + '°';
+    $('gimbalExtend').textContent = '伸出 · ' + (presets ? presets.gimbalOut : 229) + '°';
+    $('presetHint').textContent = !available ? '等待主控预设角度。' : !state.servoPresetsSupported ? '请同时更新 STM32 和 ESP32，开放全角度试调及目标保存。' : !state.presetStorageReady ? 'ESP32 保存空间不可用。当前主控预设只在本次上电中有效，请检查 ESP32 固件。' : state.presetsPending ? '预设传输中，等待主控确认。' : state.presetsSaved ? '预设已保存在 ESP32；上电会同步给主控，手动快捷按钮和自动抓取使用同一组角度。' : '当前显示主控预设。点击“设为…”后，主控确认并保存在 ESP32；保存只更新预设，不会立即移动舵机。';
+    $('clawHint').textContent = servoDisabledReason() || '可以操作夹爪。';
+    $('gimbalHint').textContent = servoDisabledReason(true) || '选定角度后，点击按钮旋转。';
+    $('trayHint').textContent = servoDisabledReason(false, true) || '先小幅选角，再点击按钮旋转料盘。';
+    $('liftState').textContent = available && state.liftEnabled ? '· 5 毫米点动' : '· 等待轴 5 驱动器反馈';
+    $('claim').disabled = !!token || claiming || document.hidden;
+    $('claim').textContent = claiming ? '申请中…' : '申请控制';
+    $('manual').disabled = !token || !available || !state.online || faulty() || commandBusy || !!modeRequestedAt || state.mode === 1 || state.pending || document.hidden;
+    $('manual').textContent = modeRequestedAt ? '等待手动确认…' : '启用手动';
+    $('release').disabled = !token;
+    motionButtons.forEach(button => {
+      const lift = button.dataset.motion === 'liftUp' || button.dataset.motion === 'liftDown';
+      button.disabled = !canPress() || (lift && !state.liftEnabled);
+    });
+    $('clawClose').disabled = $('clawOpen').disabled = !canServo();
+    const canTask = !!token && available && state.online && state.taskSupported && !faulty() && state.mode !== 2 && !state.pending && stopped() && !commandBusy && !press && !zeroFlight && !document.hidden;
+    $('save').disabled = !canTask;
+    taskIds.forEach(id => $(id).disabled = !!commandBusy || !!available && state.mode === 2);
+    for (let i=1; i<=3; ++i) {
+      const colors = shapeColors[Number($('shape'+i).value)] || [];
+      Array.from($('color'+i).options || []).forEach(option => { option.disabled = option.hidden = !colors.includes(Number(option.value)); });
+    }
+    $('taskStatus').textContent = !available || !state.online ? '等待主控连接。' : !state.taskSupported ? '请更新主控固件以接收抓取顺序。' : state.taskPending ? '等待主控确认抓取顺序。' : taskMatches() ? '主控已确认：' + planText(state.taskPlan) : '当前选择尚未确认，请发送抓取顺序。';
+    $('autoStart').disabled = !token || !available || !state.online || !state.autoSupported || !state.taskSupported || !taskMatches() || !stopped() || faulty() || state.mode===2 || state.pending || commandBusy || !!press || !!zeroFlight || document.hidden || !$('positioned').checked;
+    $('autoCancel').disabled = !token || !available || state.mode!==2 || commandBusy || document.hidden;
+    const steps=['待机','准备装载','视觉对齐','下降抓取','夹紧物料','抬起物料','收回至储料盘','前往投放区','展开夹爪','下降投放','松开投放','抬起夹爪','返回起点','三件完成','已停止','任务故障','下降存料','松开存料','抬起空夹爪','伸出准备下一件','回到取料点','转盘对准待投物料','下降取出物料','夹紧盘中物料','抬起盘中物料','收回准备行驶'];
+    $('autoStatus').textContent = available && state.autoSupported ? (steps[state.autoState] || '状态未知') + ' · 当前第 ' + (state.autoDrop+1) + ' 件 · 估计位置 (' + state.autoXcm + ', ' + state.autoYcm + ') cm' + (state.autoError ? ' · 原因 ' + state.autoError : '') : '等待自动任务固件';
+    if (!available) $('ack').textContent = '等待设备状态';
+    else if (actuatorPending) $('ack').textContent = '等待主控确认' + actuatorPending.name + '指令';
+    else if (state.pending || modeRequestedAt) $('ack').textContent = '等待主控确认';
+    else if (state.ackValid) $('ack').textContent = state.ackResult === 0 ? '最近主控指令已确认' : '最近主控指令未接受（结果 ' + String(state.ackResult) + '）';
+    else $('ack').textContent = '等待主控指令确认';
+  }
+
+  async function api(path, options = {}) {
+    const controller = options.controller || new AbortController();
+    let timedOut = false;
+    controllers.add(controller);
+    const timer = setTimeout(() => { timedOut = true; controller.abort(); }, 500);
+    const headers = {};
+    if (options.auth) headers['X-Token'] = options.auth;
+    const method = options.method || 'POST';
+    if (method === 'POST') headers['Content-Type'] = 'application/x-www-form-urlencoded';
+    try {
+      const response = await fetch(path, {
+        method, headers, cache: 'no-store', signal: controller.signal,
+        body: method === 'POST' ? new URLSearchParams(options.fields || {}).toString() : undefined,
+        keepalive: !!options.keepalive
+      });
+      const body = await response.text();
+      let result = {};
+      if (body) {
+        try { result = JSON.parse(body); }
+        catch (_) { throw new Error('设备返回了无法读取的响应'); }
+      }
+      if (!response.ok || result.ok === false) {
+        const detail = result.message || result.error;
+        throw new Error(response.status === 409 && path === '/api/claim' ? '已有操作者，请等待对方退出控制' : detail ? String(detail) : '设备拒绝了请求（' + response.status + '）');
+      }
+      return result;
+    } catch (error) {
+      if (timedOut) throw new Error('连接超时，控制已停止，请重新申请');
+      if (error.name === 'AbortError') throw error;
+      throw new Error(error.message || '连接失败，请检查设备热点');
+    } finally {
+      clearTimeout(timer);
+      controllers.delete(controller);
+    }
+  }
+
+  function clearPress() {
+    const oldPress = press;
+    press = null;
+    if (oldPress) {
+      oldPress.button.classList.remove('pressed');
+      try {
+        if (oldPress.button.hasPointerCapture(oldPress.pointerId)) oldPress.button.releasePointerCapture(oldPress.pointerId);
+      } catch (_) {}
+    }
+  }
+
+  function forgetControl() {
+    ++epoch;
+    token = '';
+    claiming = false;
+    commandBusy = false;
+    actuatorPending = null;
+    modeRequestedAt = 0;
+    clearPress();
+    for (const controller of controllers) controller.abort();
+    jogFlight = zeroFlight = pingFlight = statusFlight = null;
+    render();
+  }
+
+  function safetyStop(message, options = {}) {
+    if (!options.always && !token && !claiming && !press) return;
+    forgetControl();
+    const stoppedEpoch = epoch;
+    notice(message, !!options.error);
+    if (options.beacon && navigator.sendBeacon) {
+      const body = new Blob([''], { type: 'application/x-www-form-urlencoded' });
+      if (navigator.sendBeacon('/api/stop', body)) return;
+    }
+    api('/api/stop', { keepalive: !!options.beacon }).catch(() => {
+      if (epoch === stoppedEpoch) notice('停止请求未确认。请检查设备连接；需要重新申请控制。', true);
+    });
+  }
+
+  function nextSequence() {
+    if (sequence >= 0xffffffff) {
+      safetyStop('本次控制已结束，请重新申请控制', { error: true });
+      return null;
+    }
+    return ++sequence;
+  }
+
+  async function pollStatus() {
+    if (statusFlight || document.hidden) return;
+    const flight = { epoch, token };
+    statusFlight = flight;
+    try {
+      const raw = await api('/api/status', { method: 'GET', auth: flight.token });
+      if (flight.epoch !== epoch || flight.token !== token) return;
+      if (!raw || typeof raw !== 'object') throw new Error('设备状态无效');
+      state = {
+        online: flag(raw.stmOnline !== undefined ? raw.stmOnline : raw.link),
+        mode: Number(raw.mode), armed: flag(raw.armed),
+        claimed: flag(raw.ownerActive !== undefined ? raw.ownerActive : raw.claimed),
+        mine: raw.mine, liftEnabled: flag(raw.liftEnabled), fault: raw.fault,
+        lastFault: Number(raw.lastFault)||0, lastFaultAgeMs: Number(raw.lastFaultAgeMs),
+        claw: Number(raw.claw), pending: flag(raw.pending),
+        jog: ['x', 'y', 'turn', 'lift'].map(key => Number(raw[key])),
+        gimbalSupported: flag(raw.gimbalSupported),
+        traySupported: flag(raw.traySupported),
+        trayAngle: validAngle(raw.trayAngle) ? Number(raw.trayAngle) : -1,
+        gimbalAngle: validAngle(raw.gimbalAngle) && Number(raw.gimbalAngle) >= (flag(raw.servoPresetsSupported) ? 0 : 54) && Number(raw.gimbalAngle) <= (flag(raw.servoPresetsSupported) ? 270 : 229) ? Number(raw.gimbalAngle) : -1,
+        clawAngle: validAngle(raw.clawAngle) ? Number(raw.clawAngle) : -1,
+        servoPresetsSupported: flag(raw.servoPresetsSupported) && ['clawClose', 'clawOpen', 'gimbalIn', 'gimbalOut'].every(key => raw.presets && validAngle(raw.presets[key])),
+        presets: raw.presets, presetsPending: flag(raw.presetsPending), presetsSaved: flag(raw.presetsSaved), presetStorageReady: flag(raw.presetStorageReady),
+        taskSupported: flag(raw.taskSupported), taskPending: flag(raw.taskPending), taskAccepted: flag(raw.taskAccepted),
+        taskPlan: Array.isArray(raw.taskPlan) ? raw.taskPlan.map(Number) : [],
+        autoSupported: flag(raw.autoSupported), autoState: Number(raw.autoState)||0,
+        autoDrop: Number(raw.autoDrop)||0, autoError: Number(raw.autoError)||0,
+        autoXcm: Number(raw.autoXcm)||0, autoYcm: Number(raw.autoYcm)||0,
+        ackSequence: Number(raw.lastAckSeq !== undefined ? raw.lastAckSeq : raw.lastAckSequence) || 0,
+        ackCommand: Number(raw.lastAckCmd !== undefined ? raw.lastAckCmd : raw.lastAckCommand),
+        ackResult: Number(raw.lastAckResult),
+        ackValid: raw.ackValid !== undefined ? flag(raw.ackValid) : Number(raw.lastAckSeq !== undefined ? raw.lastAckSeq : raw.lastAckSequence) > 0
+      };
+      stateTime = Date.now();
+      networkError = false;
+      if (!gimbalInitialized && !gimbalEdited && state.gimbalAngle >= 0) {
+        $('gimbalAngle').value = String(state.gimbalAngle);
+        $('gimbalValue').textContent = state.gimbalAngle + '°';
+        gimbalInitialized = true;
+      }
+      if (!clawInitialized && !clawEdited && state.clawAngle >= 0) {
+        $('clawAngle').value = String(state.clawAngle);
+        $('clawValue').textContent = state.clawAngle + '°';
+        clawInitialized = true;
+      }
+      if (!trayInitialized && !trayEdited && state.traySupported && state.trayAngle >= 0) {
+        $('trayAngle').value = String(state.trayAngle);
+        $('trayValue').textContent = state.trayAngle + '°';
+        trayInitialized = true;
+      }
+      if (!taskInitialized && !taskEdited && state.taskAccepted && validPlan(state.taskPlan)) {
+        taskIds.forEach((id,i) => $(id).value = String(state.taskPlan[i]));
+        taskInitialized = true;
+      }
+      if (token && (!state.claimed || (raw.mine !== undefined && !flag(raw.mine)))) {
+        const fault = state.fault || (state.lastFaultAgeMs >= 0 && state.lastFaultAgeMs < 2500 ? state.lastFault : 0);
+        safetyStop(faultMessages[fault] || '控制权限已失效，请重新申请', { error: true });
+        return;
+      }
+      if (token && (!state.online || faulty())) {
+        safetyStop(!state.online ? '主控离线，控制已停止' : (faultMessages[state.fault] || '设备出现故障，控制已停止'), { error: true });
+        return;
+      }
+      if (press && !canAct()) {
+        safetyStop('设备已退出可操作状态，控制已停止', { error: true });
+        return;
+      }
+      if (actuatorPending) {
+        const pending = actuatorPending;
+        if (state.ackValid && state.ackSequence === pending.sequence && state.ackCommand === pending.command) {
+          actuatorPending = null;
+          commandBusy = false;
+          if (state.ackResult !== 0) {
+            const reasons = {1:'参数无效', 2:'当前模式不允许此操作', 3:'固件不支持', 4:'指令已过期', 5:'运动互锁或设备状态不满足要求'};
+            safetyStop(pending.name + '指令被主控拒绝：' + (reasons[state.ackResult] || '结果 ' + state.ackResult) + '。请检查状态后重新申请控制。', { error: true });
+            return;
+          }
+          if (pending.command === 7) notice('主控已接受抓取顺序：' + planText(pending.plan) + '。确认起点后可启动。');
+          else if (pending.command === 8) notice('主控已接受自动任务，按已确认顺序抓取三件物料。');
+          else if (pending.command === 12) notice('主控已接受' + pending.target + '。' + (state.presetsSaved ? '预设已保存，手动和自动动作使用新角度。' : '请查看下方保存状态；预设保存不移动舵机。'));
+          else notice('主控已接受' + pending.target + '。若仍不动作，请检查舵机供电和信号接线；当前没有舵机位置反馈。');
+        } else if (Date.now() - pending.sentAt >= 1500) {
+          safetyStop(pending.name + '指令没有收到主控确认，控制已停止，请检查串口和主控固件。', { error: true });
+          return;
+        }
+      }
+      if (modeRequestedAt && state.mode === 1 && state.armed) {
+        modeRequestedAt = 0;
+        notice('手动已启用。按住方向按钮移动，松手停止。');
+      } else if (modeRequestedAt && Date.now() - modeRequestedAt > 2000 && !state.pending) {
+        modeRequestedAt = 0;
+        notice('主控尚未确认手动，请检查设备状态后再启用', true);
+      }
+      render();
+    } catch (error) {
+      if (flight.epoch !== epoch || flight.token !== token) return;
+      networkError = true;
+      stateTime = 0;
+      if (token || claiming) safetyStop(error.message, { error: true });
+      else notice('无法读取设备状态，请确认已连接设备热点', true);
+      render();
+    } finally {
+      if (statusFlight === flight) statusFlight = null;
+    }
+  }
+
+  async function ping() {
+    if (!token || pingFlight || document.hidden) return;
+    const flight = { epoch, token };
+    pingFlight = flight;
+    try {
+      await api('/api/ping', { auth: flight.token });
+    } catch (error) {
+      if (flight.epoch === epoch) safetyStop(error.message, { error: true });
+    } finally {
+      if (pingFlight === flight) pingFlight = null;
+    }
+  }
+
+  async function claimControl() {
+    if (token || claiming || document.hidden) return;
+    claiming = true;
+    const startedEpoch = ++epoch;
+    notice('正在申请控制…');
+    render();
+    try {
+      const result = await api('/api/claim');
+      if (startedEpoch !== epoch) return;
+      if (typeof result.token !== 'string' || !/^[0-9a-fA-F]{16}$/.test(result.token)) throw new Error('设备没有返回有效的控制权限');
+      token = result.token;
+      sequence = 0;
+      stateTime = 0;
+      networkError = false;
+      notice('已取得控制，等待设备状态后可启用手动。');
+      ping();
+    } catch (error) {
+      if (startedEpoch === epoch) notice(error.message, true);
+    } finally {
+      if (startedEpoch === epoch) { claiming = false; render(); }
+    }
+    pollStatus();
+  }
+
+  async function controlledCommand(path, fields, message) {
+    if (!token || commandBusy || press || zeroFlight) return;
+    const seq = nextSequence();
+    if (seq === null) return;
+    const startedEpoch = epoch, commandToken = token;
+    commandBusy = true;
+    if (path === '/api/mode') modeRequestedAt = Date.now();
+    render();
+    try {
+      const result = await api(path, { auth: commandToken, fields: { seq, ...fields } });
+      if (startedEpoch !== epoch) return;
+      if (['/api/claw', '/api/gimbal', '/api/claw-angle', '/api/servo-presets', '/api/tray-angle', '/api/task', '/api/start'].includes(path)) {
+        if (!result.queued || !Number.isInteger(result.uartSeq) || result.uartSeq < 0 || result.uartSeq > 65535)
+          throw new Error('设备未返回有效的主控指令序号，请更新 ESP32 固件');
+        actuatorPending = {
+          sequence: result.uartSeq, command: {'/api/claw':6, '/api/gimbal':10, '/api/claw-angle':11, '/api/servo-presets':12, '/api/tray-angle':13, '/api/task':7, '/api/start':8}[path],
+          plan: path === '/api/task' ? taskIds.map(id => Number(fields[id])) : null,
+          name: path === '/api/task' ? '抓取顺序' : path === '/api/start' ? '自动任务' : path === '/api/servo-presets' ? '角度预设' : path === '/api/gimbal' ? '云台' : path === '/api/tray-angle' ? '转盘' : '夹爪', sentAt: Date.now(),
+          target: path === '/api/claw' ? (Number(fields.value) === 0 ? '夹爪闭合目标' : '夹爪张开目标') : path === '/api/servo-presets' ? '新的角度预设' : (path === '/api/gimbal' ? '云台' : path === '/api/tray-angle' ? '转盘' : '夹爪') + '目标角度 ' + fields.angle + '°'
+        };
+      }
+      notice(message);
+    } catch (error) {
+      if (startedEpoch === epoch) safetyStop(error.message, { error: true });
+    } finally {
+      if (startedEpoch === epoch) { commandBusy = !!actuatorPending; render(); }
+    }
+    pollStatus();
+  }
+
+  async function releaseControl() {
+    if (!token) return;
+    const oldToken = token;
+    forgetControl();
+    const releasedEpoch = epoch;
+    notice('正在退出控制…');
+    try {
+      await api('/api/release', { auth: oldToken });
+      if (releasedEpoch === epoch) notice('已退出控制。再次操作需要重新申请。');
+    } catch (error) {
+      if (releasedEpoch === epoch) safetyStop(error.message, { always: true, error: true });
+    }
+    pollStatus();
+  }
+
+  async function sendHeldJog() {
+    if (!press || jogFlight || !canPress()) return;
+    const seq = nextSequence();
+    if (seq === null) return;
+    const vector = motion[press.name], speed = Number($('speed').value);
+    const flight = { epoch, cancelled: false, controller: new AbortController() };
+    jogFlight = flight;
+    try {
+      await api('/api/jog', {
+        auth: token, controller: flight.controller,
+        fields: { seq, x: vector[0] * speed, y: vector[1] * speed, turn: vector[2] * speed, lift: vector[3] }
+      });
+    } catch (error) {
+      if (!flight.cancelled && flight.epoch === epoch) safetyStop(error.message, { error: true });
+    } finally {
+      if (jogFlight === flight) jogFlight = null;
+    }
+  }
+
+  async function endPress(event) {
+    if (!press || (event && event.pointerId !== press.pointerId)) return;
+    clearPress();
+    if (!token) return;
+    if (jogFlight) {
+      jogFlight.cancelled = true;
+      jogFlight.controller.abort();
+      jogFlight = null;
+    }
+    const seq = nextSequence();
+    if (seq === null) return;
+    const flight = { epoch };
+    zeroFlight = flight;
+    render();
+    try {
+      // The newer zero command may pass an older request still reaching the device.
+      await api('/api/jog', { auth: token, fields: { seq, x: 0, y: 0, turn: 0, lift: 0 } });
+    } catch (error) {
+      if (flight.epoch === epoch) safetyStop(error.message, { error: true });
+    } finally {
+      if (zeroFlight === flight) { zeroFlight = null; render(); }
+    }
+  }
+
+  motionButtons.forEach(button => {
+    button.addEventListener('contextmenu', event => event.preventDefault());
+    button.addEventListener('pointerdown', event => {
+      event.preventDefault();
+      if (event.button !== 0 || press || !canPress() || button.disabled) return;
+      press = { button, pointerId: event.pointerId, name: button.dataset.motion };
+      button.classList.add('pressed');
+      try { button.setPointerCapture(event.pointerId); } catch (_) {}
+      render();
+      sendHeldJog();
+    });
+    button.addEventListener('pointerup', endPress);
+    button.addEventListener('pointercancel', endPress);
+    button.addEventListener('lostpointercapture', endPress);
+  });
+  window.addEventListener('pointerup', endPress);
+  window.addEventListener('pointercancel', endPress);
+  window.addEventListener('blur', () => safetyStop('页面失去焦点，控制已停止，请重新申请'));
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) safetyStop('页面进入后台，控制已停止，请重新申请', { beacon: true });
+    else { render(); pollStatus(); }
+  });
+  window.addEventListener('pagehide', () => safetyStop('页面已关闭，控制已停止', { beacon: true }));
+  $('claim').addEventListener('click', claimControl);
+  $('manual').addEventListener('click', () => {
+    if (!$('manual').disabled) controlledCommand('/api/mode', { value: 1 }, '已发送启用手动，等待主控确认。');
+  });
+  $('release').addEventListener('click', releaseControl);
+  $('positioned').addEventListener('change',render);
+  $('autoStart').addEventListener('click',()=>{
+    if ($('autoStart').disabled) return;
+    $('positioned').checked=false;
+    controlledCommand('/api/start',{positioned:1,...taskFields()},'已发送启动，请查看自动任务状态和主控确认。');
+  });
+  $('autoCancel').addEventListener('click',()=>{
+    if (!$('autoCancel').disabled) controlledCommand('/api/pause',{},'已请求停止自动任务；再次启动前恢复起点和升降高度。');
+  });
+  $('stop').addEventListener('click', () => safetyStop('已请求停止并退出手动。再次操作需要重新申请。', { always: true }));
+  $('clawClose').addEventListener('click', () => {
+    if (!$('clawClose').disabled) controlledCommand('/api/claw', { value: 0 }, '已发送闭合目标，等待主控确认。');
+  });
+  $('clawOpen').addEventListener('click', () => {
+    if (!$('clawOpen').disabled) controlledCommand('/api/claw', { value: 1 }, '已发送张开目标，等待主控确认。');
+  });
+  function sendGimbal(value) {
+    if (!canGimbal()) return;
+    const angle = Number(value);
+    if (String(value).trim() === '' || !Number.isInteger(angle) || angle < gimbalMinimum() || angle > gimbalMaximum()) {
+      notice('云台角度须为 ' + gimbalMinimum() + '° 至 ' + gimbalMaximum() + '° 的整数', true);
+      return;
+    }
+    $('gimbalAngle').value = String(angle);
+    $('gimbalValue').textContent = angle + '°';
+    gimbalEdited = true;
+    controlledCommand('/api/gimbal', { angle }, '已发送云台目标角度 ' + angle + '°，等待主控确认。');
+  }
+  $('gimbalAngle').addEventListener('input', () => { gimbalEdited = true; $('gimbalValue').textContent = $('gimbalAngle').value + '°'; });
+  $('gimbalApply').addEventListener('click', () => sendGimbal($('gimbalAngle').value));
+  $('gimbalRetract').addEventListener('click', () => sendGimbal(state && state.servoPresetsSupported ? state.presets.gimbalIn : 54));
+  $('gimbalExtend').addEventListener('click', () => sendGimbal(state && state.servoPresetsSupported ? state.presets.gimbalOut : 229));
+  $('trayAngle').addEventListener('input', () => { trayEdited = true; $('trayValue').textContent = $('trayAngle').value + '°'; });
+  function adjustTray(delta) {
+    if (!canTray() || !validAngle($('trayAngle').value)) return;
+    const angle = Math.max(0, Math.min(270, Number($('trayAngle').value) + delta));
+    $('trayAngle').value = String(angle);
+    $('trayValue').textContent = angle + '°';
+    trayEdited = true;
+  }
+  $('trayMinus').addEventListener('click', () => adjustTray(-5));
+  $('trayPlus').addEventListener('click', () => adjustTray(5));
+  $('trayApply').addEventListener('click', () => {
+    if (!canTray()) return;
+    const angle = $('trayAngle').value;
+    if (!validAngle(angle)) { notice('转盘角度须为 0° 至 270° 的整数', true); return; }
+    trayEdited = true;
+    controlledCommand('/api/tray-angle', {angle: Number(angle)}, '已发送转盘目标角度 ' + angle + '°，等待主控确认。');
+  });
+  $('clawAngle').addEventListener('input', () => { clawEdited = true; $('clawValue').textContent = $('clawAngle').value + '°'; });
+  $('clawApply').addEventListener('click', () => {
+    if (!canAdjust()) return;
+    const angle = $('clawAngle').value;
+    if (!validAngle(angle)) { notice('夹爪角度须为 0° 至 270° 的整数', true); return; }
+    controlledCommand('/api/claw-angle', {angle: Number(angle)}, '已发送夹爪试调角度，等待主控确认。');
+  });
+  function savePreset(key, inputId) {
+    if (!canAdjust()) return;
+    const value = $(inputId).value;
+    if (!validAngle(value)) { notice('预设角度须为 0° 至 270° 的整数', true); return; }
+    const fields = {...state.presets, [key]: Number(value)};
+    controlledCommand('/api/servo-presets', fields, '正在保存角度预设，等待主控确认；舵机不会立即动作。');
+  }
+  $('clawSetClose').addEventListener('click', () => savePreset('clawClose', 'clawAngle'));
+  $('clawSetOpen').addEventListener('click', () => savePreset('clawOpen', 'clawAngle'));
+  $('gimbalSetRetract').addEventListener('click', () => savePreset('gimbalIn', 'gimbalAngle'));
+  $('gimbalSetExtend').addEventListener('click', () => savePreset('gimbalOut', 'gimbalAngle'));
+  $('speed').addEventListener('input', () => { $('speedValue').textContent = $('speed').value + '%'; });
+  taskIds.forEach(id => $(id).addEventListener('input', () => {
+    taskEdited = true;
+    if (id.startsWith('shape')) {
+      const colors = shapeColors[Number($(id).value)];
+      const color = $('color' + id.slice(5));
+      if (colors && !colors.includes(Number(color.value))) color.value = String(colors[0]);
+    }
+    render();
+  }));
+  $('save').addEventListener('click', () => {
+    if ($('save').disabled) return;
+    if (!validPlan(taskSelection())) { notice('请为三件物料选择有效的颜色和形状', true); return; }
+    controlledCommand('/api/task', taskFields(), '已发送抓取顺序，等待主控确认。');
+  });
+  // Browser ownership and motion have separate leases; ping never sends motion.
+  setInterval(ping, 150);
+  setInterval(sendHeldJog, 100);
+  setInterval(pollStatus, 300);
+  render();
+  pollStatus();
+})();
+</script>
+</body>
+</html>)HTML";

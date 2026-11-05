@@ -1,0 +1,55 @@
+# Rebuildable output and caches (source, tests and the K230 model are retained)
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+node_modules/
+.venv/
+
+/MDK-ARM/robot/
+/MDK-ARM/build/
+/MDK-ARM/.cmsis/
+/MDK-ARM/Objects/
+/MDK-ARM/Listings/
+
+# Per-user IDE and debugger state
+.vscode/
+*.uvguix.*
+*.uvoptx
+JLinkLog.txt
+JLinkSettings.ini
+/.mxproject
+/MDK-ARM/DebugConfig/
+
+*.bak
+*.orig
+*.tmp
+*.log
+*.o
+*.obj
+*.crf
+*.lst
+*.axf
+*.map
+*.dep
+*.lnp
+*.__i
+
+# Host-test binaries; vendor libraries under Drivers are kept
+/tests/**/*.exe
+/tests/**/*.dll
+/tests/**/*.lib
+/tests/**/*.exp
+/tests/**/*.pdb
+/tests/**/*.ilk
+
+# Local credentials must never be added
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+
+/tests/.build/
