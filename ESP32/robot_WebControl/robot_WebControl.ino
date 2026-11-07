@@ -1,5 +1,7 @@
-/* ESP32-WROOM / DevKit, Arduino IDE, no third-party libraries required.
+/* ESP32-WROOM / DevKit or ESP32-S3 N16R8, Arduino IDE.
+ * Uses only libraries supplied with the Arduino ESP32 core.
  * GPIO17 TX -> STM32 PA1 (UART4 RX); GPIO16 RX <- PA0 (UART4 TX).
+ * Keep explicit UART pins on S3; GPIO19/20 are reserved for native USB.
  * Flash the matching robot STM32 project as well. Common GND, 3.3 V UART.
  */
 #include <WiFi.h>
