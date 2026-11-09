@@ -156,16 +156,16 @@ static void gimbalTests(){
 static void tests(){
   reset();claimed();modeRequest();feedback(WEB_CMD_MODE,(uint16_t)(control.armSequence+1));CHECK(!control.armed && control.armPending);
   feedback(WEB_CMD_MODE,control.armSequence);CHECK(control.armed);
-  reset();claimed();modeRequest();feedback(WEB_CMD_MODE,control.armSequence,WEB_RESULT_STALE);CHECK(!control.token && !control.armed && countSent(WEB_CMD_STOP)==1);
+  reset();claimed();modeRequest();feedback(WEB_CMD_MODE,control.armSequence,WEB_RESULT_STALE);CHECK(!control.token && !control.armed && countSent(WEB_CMD_MANUAL_RELEASE)==1 && countSent(WEB_CMD_STOP)==0);
   reset();claimed();modeRequest();feedback(WEB_CMD_MODE,control.armSequence,WEB_RESULT_OK,WEB_MODE_MANUAL,6);CHECK(!control.token && !control.armed);
   reset();claimed();modeRequest();test_ms+=599;control.lastSeen=test_ms;status(1);feedback(WEB_CMD_MODE,control.armSequence);CHECK(control.armed);
-  reset();claimed();modeRequest();test_ms+=600;control.lastSeen=test_ms;status(1);feedback(WEB_CMD_MODE,control.armSequence);CHECK(!control.armed);loop();CHECK(!control.token && countSent(WEB_CMD_STOP)>=1);
+  reset();claimed();modeRequest();test_ms+=600;control.lastSeen=test_ms;status(1);feedback(WEB_CMD_MODE,control.armSequence);CHECK(!control.armed);loop();CHECK(!control.token && countSent(WEB_CMD_MANUAL_RELEASE)>=1 && countSent(WEB_CMD_STOP)==0);
   reset();claimed();modeRequest();test_ms+=600;control.lastSeen=test_ms;feedback(WEB_CMD_MODE,control.armSequence);CHECK(!control.armed);loop();CHECK(!control.token);
   reset();claimed();modeRequest();uint16_t pending=control.armSequence;uint64_t old_token=control.token;stopAndRevoke();feedback(WEB_CMD_MODE,pending);CHECK(!control.token && !control.armed);
   clearRequest();char old_text[17];snprintf(old_text,sizeof old_text,"%016llx",(unsigned long long)old_token);server.headers["X-Token"]=old_text;server.args["seq"]="2";server.args["value"]="1";handleMode();CHECK(server.code==403);
   server.args["x"]="0";server.args["y"]="20";server.args["turn"]="0";server.args["lift"]="0";handleJog();CHECK(server.code==403);
   reset();armed();jogRequest(3,0);CHECK(server.code==202 && !control.moving);unsigned sent=countSent(WEB_CMD_JOG);jogRequest(2,20);CHECK(server.code==409 && !control.moving && countSent(WEB_CMD_JOG)==sent);
-  reset();armed();jogRequest(2,20);CHECK(server.code==202 && control.moving);uint32_t jog_time=control.lastJog;test_ms+=200;auth();server.routes["/api/ping"]();CHECK(server.code==200 && control.lastJog==jog_time && control.moving);test_ms=jog_time+300;loop();CHECK(!control.token && !control.moving && countSent(WEB_CMD_STOP)>=1);
+  reset();armed();jogRequest(2,20);CHECK(server.code==202 && control.moving);uint32_t jog_time=control.lastJog;test_ms+=200;auth();server.routes["/api/ping"]();CHECK(server.code==200 && control.lastJog==jog_time && control.moving);test_ms=jog_time+300;loop();CHECK(!control.token && !control.moving && countSent(WEB_CMD_MANUAL_RELEASE)>=1 && countSent(WEB_CMD_STOP)==0);
   reset();claimed();test_ms+=850;auth();server.routes["/api/ping"]();CHECK(server.code==403 && !control.token);
   reset(false);uint32_t session=uartSession;test_ms+=600;loop();CHECK(uartSession!=session && !helloAccepted && !statusReceived && countSent(WEB_CMD_HELLO)>=2);
   reset();armed();status(65535,WEB_MODE_MANUAL);CHECK(statusSequence==1); // Old half-range status cannot rewrite state.
@@ -217,4 +217,51 @@ static void taskTests(){
   reset();claimed();extendedStatus(1,32,120,WEB_MODE_IDLE);stmJog[3]=1;planArgs(1);handleTask();CHECK(server.code==409 && countSent(WEB_CMD_TASK)==0);stmJog[3]=0;
   planArgs(2);handleTask();sent=taskApplySequence;stopAndRevoke();feedback(WEB_CMD_TASK,sent);CHECK(!taskPending && !taskSubmitted);
 }
-int main(){setup();tests();gimbalTests();servoFeedbackTests();anglePresetTests();presetRestoreTests();trayTests();taskTests();printf("ESP32 API integration review: %u failure(s)\n",failures);return failures?1:0;}
+static void autonomousLifetimeTests(){
+  CHECK(server.routes.count("/api/manual-release")==1);
+  reset();claimed();extendedStatus(1,32,120,WEB_MODE_AUTO);
+  uint8_t acceptedPlan[WEB_TASK_PLAN_SIZE]={4,1,7,4,3,3};
+  memcpy(taskPlan,acceptedPlan,sizeof(taskPlan));taskSubmitted=true;
+  test_ms+=850;statusAt=test_ms;
+  loop();
+  CHECK(!control.token && stmMode==WEB_MODE_AUTO);
+  CHECK(countSent(WEB_CMD_MANUAL_RELEASE)==1 && countSent(WEB_CMD_STOP)==0);
+  CHECK(taskSubmitted && memcmp(taskPlan,acceptedPlan,sizeof(taskPlan))==0);
+
+  reset();claimed();extendedStatus(1,32,120,WEB_MODE_AUTO);
+  uint32_t previousSession=uartSession;
+  test_ms+=600;control.lastSeen=test_ms;
+  loop();
+  CHECK(uartSession!=previousSession && !control.token);
+  CHECK(countSent(WEB_CMD_MANUAL_RELEASE)==1 && countSent(WEB_CMD_STOP)==0);
+  feedback(WEB_CMD_HELLO,1);
+  extendedStatus(1,32,120,WEB_MODE_AUTO);
+  CHECK(stmMode==WEB_MODE_AUTO && stmTaskReady);
+  uint16_t presets[]={20,125,240,170};
+  memcpy(savedPresets,presets,sizeof(savedPresets));savedPresetsValid=true;
+  servicePresets();
+  CHECK(countSent(WEB_CMD_SERVO_PRESETS)==0);
+  claimed();auth(1);server.args["value"]="1";handleMode();
+  CHECK(server.code==409 && countSent(WEB_CMD_MODE)==0 && stmMode==WEB_MODE_AUTO);
+  auth();server.routes["/api/release"]();
+  CHECK(server.code==200 && !control.token && stmMode==WEB_MODE_AUTO);
+  CHECK(countSent(WEB_CMD_STOP)==0);
+
+  reset();claimed();extendedStatus(1,32,120,WEB_MODE_IDLE);
+  planArgs(1);handleTask();feedback(WEB_CMD_TASK,taskApplySequence);
+  planArgs(2);server.args["positioned"]="1";handleStart();
+  CHECK(server.code==202 && countSent(WEB_CMD_START)==1);
+  CHECK(stmMode==WEB_MODE_IDLE); // START has left the bridge before its status returns.
+  clearRequest();server.routes["/api/manual-release"]();
+  CHECK(server.code==200 && !control.token && countSent(WEB_CMD_STOP)==0);
+  CHECK(countSent(WEB_CMD_MANUAL_RELEASE)==1);
+  extendedStatus(2,32,120,WEB_MODE_AUTO);
+  CHECK(stmMode==WEB_MODE_AUTO && taskSubmitted);
+  clearRequest();server.routes["/api/stop"]();
+  CHECK(server.code==200 && countSent(WEB_CMD_STOP)==1);
+
+  reset();claimed();extendedStatus(1,32,120,WEB_MODE_AUTO);
+  auth(1);handlePause();
+  CHECK(server.code==202 && countSent(WEB_CMD_PAUSE)==1);
+}
+int main(){setup();tests();gimbalTests();servoFeedbackTests();anglePresetTests();presetRestoreTests();trayTests();taskTests();autonomousLifetimeTests();printf("ESP32 API integration review: %u failure(s)\n",failures);return failures?1:0;}

@@ -3,6 +3,7 @@
 #include <vector>
 #include "stubs/hal_stubs.h"
 #include "../../Core/Inc/web_protocol.h"
+#include "../../Core/Inc/logistics_task.h"
 #include "../../Core/Src/web_control.c"
 
 UART_HandleTypeDef huart1={1}, huart4={4};
@@ -11,12 +12,13 @@ uint8_t vision_follow_enable;
 int start, zero;
 volatile uint8_t logistics_state,logistics_drop_index,logistics_error;
 volatile float logistics_x_m,logistics_y_m;
-static unsigned auto_starts;
+static unsigned auto_starts, automatic_cycles;
+static unsigned motor_transaction_depth;
 static unsigned plan_set_calls, plan_clear_calls;
 static bool review_plan_ready;
 static uint8_t review_plan[WEB_TASK_PLAN_SIZE];
 static const uint8_t sample_plan[WEB_TASK_PLAN_SIZE]={4U,1U,7U,4U,3U,3U};
-void Logistics_Init(void){logistics_state=LOG_IDLE;logistics_error=logistics_drop_index=0;auto_starts=plan_set_calls=plan_clear_calls=0;review_plan_ready=false;memset(review_plan,0,sizeof(review_plan));}
+void Logistics_Init(void){logistics_state=LOG_IDLE;logistics_error=logistics_drop_index=0;auto_starts=automatic_cycles=plan_set_calls=plan_clear_calls=0;review_plan_ready=false;memset(review_plan,0,sizeof(review_plan));}
 uint8_t Logistics_IsRunning(void){return (logistics_state>=LOG_PREPARE && logistics_state<=LOG_RETURN) || (logistics_state>=LOG_STORE_LOWER && logistics_state<=LOG_DELIVERY_FOLD);}
 uint8_t Logistics_Start(void){if(!review_plan_ready)return 0;++auto_starts;logistics_state=LOG_PREPARE;return 1;}
 void Logistics_Cancel(void){if(Logistics_IsRunning())logistics_state=LOG_ABORTED;}
@@ -38,8 +40,29 @@ uint8_t Logistics_SetPlan(const uint8_t *items,uint8_t length){
 uint8_t Logistics_PlanMatches(const uint8_t *items,uint8_t length){return review_plan_ready && items && length==sizeof(review_plan) && memcmp(review_plan,items,sizeof(review_plan))==0;}
 uint8_t Logistics_PlanReady(void){return review_plan_ready?1U:0U;}
 void Logistics_ClearPlan(void){++plan_clear_calls;Logistics_Cancel();review_plan_ready=false;memset(review_plan,0,sizeof(review_plan));}
-void Logistics_Task(void){}
+void Logistics_Task(void){++automatic_cycles;}
 uint8_t Logistics_GetLiftFeedback(int64_t *,uint32_t *,uint32_t *){return 0;}
+/* Stand-in for the independent automatic-task command queue. */
+void RobotControl_ReadStatus(RobotStatus *status) {
+  status->state=logistics_state; status->drop_index=logistics_drop_index;
+  status->error=logistics_error; status->running=Logistics_IsRunning();
+  status->plan_ready=Logistics_PlanReady();
+  status->x_m=logistics_x_m; status->y_m=logistics_y_m;
+}
+uint8_t RobotControl_IsAutomatic(void){return Logistics_IsRunning();}
+uint8_t RobotControl_SetPlan(const uint8_t *items,uint8_t length) {
+  if(Logistics_IsRunning()) return WEB_RESULT_WRONG_MODE;
+  return Logistics_SetPlan(items,length) ? WEB_RESULT_OK : WEB_RESULT_BAD_ARGUMENT;
+}
+uint8_t RobotControl_Start(const uint8_t *items,uint8_t length) {
+  if(Logistics_IsRunning()) return WEB_RESULT_WRONG_MODE;
+  if(!Logistics_PlanMatches(items,length)) return WEB_RESULT_INTERLOCK;
+  return Logistics_Start() ? WEB_RESULT_OK : WEB_RESULT_INTERLOCK;
+}
+uint8_t RobotControl_Stop(void){Logistics_Cancel();return WEB_RESULT_OK;}
+uint8_t RobotControl_GetLiftFeedback(int64_t *count,uint32_t *tick,uint32_t *serial) {
+  return Logistics_GetLiftFeedback(count,tick,serial);
+}
 static uint32_t clock_ms;
 static uint8_t *receive_byte;
 static unsigned go_count, stop_count, claw_count, failures;
@@ -58,6 +81,14 @@ static std::vector<WebFrame> replies;
 #define CHECK(cond) do { if (!(cond)) { printf("FAIL %s:%d: %s\n",__FILE__,__LINE__,#cond);++failures; } } while(0)
 uint32_t HAL_GetTick(void){return clock_ms;}
 void HAL_Delay(uint32_t n){clock_ms+=n;}
+void MotorBus_Begin(void){++motor_transaction_depth;}
+void MotorBus_End(void){CHECK(motor_transaction_depth>0U);--motor_transaction_depth;}
+uint8_t MotorBus_Transmit(const uint8_t *data,uint16_t size,uint32_t gap_ms) {
+  CHECK(motor_transaction_depth>0U);
+  uint8_t ok=HAL_UART_Transmit(&huart1,(uint8_t *)data,size,10U)==HAL_OK;
+  clock_ms+=gap_ms;
+  return ok;
+}
 HAL_StatusTypeDef HAL_UART_Transmit(UART_HandleTypeDef *port,uint8_t *wire,uint16_t n,uint32_t timeout){
   CHECK(timeout==10);
   if(port==&huart1){
@@ -95,7 +126,7 @@ static void request(uint8_t command,uint32_t session,uint16_t sequence,const int
   WebFrame f={};f.command=command;f.session=session;f.sequence=sequence;f.length=n;
   if(n)memcpy(f.payload,payload,n);uint8_t wire[WEB_MAX_FRAME];uint8_t bytes=Web_Encode(&f,wire);inject(wire,bytes);if(process)WebControl_Task();
 }
-static void reset(){clock_ms=1;start=zero=0;vision_follow_enable=0;fail_motor=fail_gimbal_pwm=fail_tray_pwm=false;claw_pwm_running=gimbal_pwm_running=tray_pwm_running=false;WebControl_Init();go_count=stop_count=claw_count=gimbal_count=gimbal_pwm_count=tray_count=tray_pwm_count=0;last_gimbal_angle=last_tray_angle=0;replies.clear();}
+static void reset(){clock_ms=1;start=zero=0;vision_follow_enable=0;fail_motor=fail_gimbal_pwm=fail_tray_pwm=false;claw_pwm_running=gimbal_pwm_running=tray_pwm_running=false;motor_transaction_depth=0;Logistics_Init();Duoji_SetPresets(GRAB,OPEN,IN,OUT);WebControl_Init();CHECK(motor_transaction_depth==0);go_count=stop_count=claw_count=gimbal_count=gimbal_pwm_count=tray_count=tray_pwm_count=0;last_gimbal_angle=last_tray_angle=0;replies.clear();}
 static void manual(uint32_t session=1,uint16_t sequence=1){request(WEB_CMD_HELLO,session,sequence);int8_t m=WEB_MODE_MANUAL;request(WEB_CMD_MODE,session,(uint16_t)(sequence+1),&m,1);CHECK(mode==WEB_MODE_MANUAL && session_valid);}
 static uint8_t lastResult(){for(size_t i=replies.size();i>0;--i)if(replies[i-1].command==WEB_CMD_ACK)return replies[i-1].payload[1];return 255;}
 static void gimbalRequest(uint16_t angle,uint16_t sequence,uint32_t session=1){uint8_t p[2];Web_Put16(p,angle);request(WEB_CMD_GIMBAL,session,sequence,(const int8_t *)p,2);}
@@ -146,7 +177,7 @@ static void tests(){
   uint8_t noise[256];memset(noise,0xA5,sizeof noise);inject(noise,sizeof noise);CHECK(rx_faults!=0);
   WebControl_Task();CHECK(!session_valid && !jog_active && mode==WEB_MODE_IDLE && fault==WEB_FAULT_RX_OVERFLOW);
   request(WEB_CMD_HELLO,3,1);CHECK(session_valid && active_session==3 && fault==WEB_FAULT_NONE);
-  reset();manual();request(WEB_CMD_JOG,1,3,jog_values,4);start=1;WebControl_Task();CHECK(!start && mode==WEB_MODE_IDLE && !jog_active);
+  reset();manual();request(WEB_CMD_JOG,1,3,jog_values,4);start=1;WebControl_Task();CHECK(start==1 && mode==WEB_MODE_MANUAL && jog_active);
   /* The reported car motion exchanges the legacy lateral/yaw patterns. Verify the
    * corrected four buttons through the wire protocol, keeping their own RPM
    * scales: 20% lateral is about 12 RPM; 20% yaw remains about 5 RPM. */
@@ -206,20 +237,41 @@ static void tests(){
   request(WEB_CMD_START,1,12,(const int8_t *)mismatched_start,sizeof(mismatched_start));CHECK(lastResult()==WEB_RESULT_INTERLOCK && auto_starts==0 && claw_count==before_claw);
   memcpy(mismatched_start+1,sample_plan,sizeof(sample_plan));mismatched_start[0]=0U;
   request(WEB_CMD_START,1,13,(const int8_t *)mismatched_start,sizeof(mismatched_start));CHECK(lastResult()==WEB_RESULT_BAD_ARGUMENT && auto_starts==0);
-  startRequest(14);CHECK(lastResult()==WEB_RESULT_OK && mode==WEB_MODE_AUTO && auto_starts==1);
+  startRequest(14);CHECK(lastResult()==WEB_RESULT_OK && RobotControl_IsAutomatic() && auto_starts==1);
   startRequest(14);CHECK(auto_starts==1); // Retry cannot restart the route.
   taskRequest(15);CHECK(lastResult()==WEB_RESULT_WRONG_MODE && plan_set_calls==set_calls && Logistics_PlanMatches(sample_plan,sizeof(sample_plan)));
   request(WEB_CMD_TASK,1,16,(const int8_t *)invalid_plan,sizeof(invalid_plan));CHECK(lastResult()==WEB_RESULT_WRONG_MODE && plan_set_calls==set_calls);
-  request(WEB_CMD_JOG,1,17,jog_values,4);CHECK(lastResult()==WEB_RESULT_WRONG_MODE && mode==WEB_MODE_AUTO);
+  request(WEB_CMD_JOG,1,17,jog_values,4);CHECK(lastResult()==WEB_RESULT_WRONG_MODE && RobotControl_IsAutomatic());
   startRequest(18);CHECK(lastResult()==WEB_RESULT_WRONG_MODE && auto_starts==1);
   request(WEB_CMD_PAUSE,1,19);CHECK(lastResult()==WEB_RESULT_OK && mode==WEB_MODE_IDLE && logistics_state==LOG_ABORTED && Logistics_PlanReady());
-  startRequest(20);CHECK(mode==WEB_MODE_AUTO && auto_starts==2);
-  request(WEB_CMD_HELLO,2,1);CHECK(mode==WEB_MODE_IDLE && logistics_state==LOG_ABORTED && !Logistics_PlanReady() && plan_clear_calls==clear_calls+1U);
-  startRequest(2,2);CHECK(lastResult()==WEB_RESULT_INTERLOCK && auto_starts==2);
+  startRequest(20);CHECK(RobotControl_IsAutomatic() && auto_starts==2);
+  unsigned automatic_stops=stop_count;
+  request(WEB_CMD_HELLO,2,1);
+  CHECK(mode==WEB_MODE_IDLE && RobotControl_IsAutomatic() && Logistics_PlanReady() && plan_clear_calls==clear_calls);
+  CHECK(stop_count==automatic_stops && auto_starts==2);
+  startRequest(2,2);CHECK(lastResult()==WEB_RESULT_WRONG_MODE && auto_starts==2);
   clock_ms+=WEB_STATUS_PERIOD_MS;request(WEB_CMD_HEARTBEAT,2,3);
-  CHECK(replies.back().length==WEB_TASK_STATUS_SIZE && replies.back().payload[30]==WEB_TASK_PROTOCOL_VERSION && replies.back().payload[31]==0U);
-  taskRequest(4,2);startRequest(5,2);CHECK(mode==WEB_MODE_AUTO && auto_starts==3);
-  clock_ms=link_tick+WEB_LINK_LEASE_MS;WebControl_Task();CHECK(mode==WEB_MODE_IDLE && logistics_state==LOG_ABORTED);
+  CHECK(replies.back().length==WEB_TASK_STATUS_SIZE && replies.back().payload[0]==WEB_MODE_AUTO && replies.back().payload[31]==1U);
+  taskRequest(4,2);CHECK(lastResult()==WEB_RESULT_WRONG_MODE);
+  request(WEB_CMD_MANUAL_RELEASE,2,5);
+  CHECK(lastResult()==WEB_RESULT_OK && RobotControl_IsAutomatic() && stop_count==automatic_stops);
+  request(WEB_CMD_MODE,2,6,&m,1);CHECK(lastResult()==WEB_RESULT_WRONG_MODE && RobotControl_IsAutomatic());
+  uint16_t held_gimbal=last_gimbal_angle;
+  gimbalRequest(90U,7U,2U);CHECK(lastResult()==WEB_RESULT_WRONG_MODE && last_gimbal_angle==held_gimbal);
+  clock_ms=link_tick+WEB_LINK_LEASE_MS;WebControl_Task();
+  CHECK(!session_valid && RobotControl_IsAutomatic() && Logistics_PlanReady() && stop_count==automatic_stops);
+  request(WEB_CMD_HELLO,3,1);CHECK(RobotControl_IsAutomatic());
+  WebControl_UartErrorISR();WebControl_Task();
+  CHECK(!session_valid && RobotControl_IsAutomatic() && stop_count==automatic_stops);
+  request(WEB_CMD_HELLO,4,1);
+  uint8_t flood[300]={};inject(flood,sizeof(flood));WebControl_Task();
+  CHECK(!session_valid && RobotControl_IsAutomatic() && stop_count==automatic_stops);
+  CHECK(automatic_cycles==0U); // Only the independent automatic task advances it.
+  request(WEB_CMD_STOP,999,1);
+  CHECK(!RobotControl_IsAutomatic() && logistics_state==LOG_ABORTED && Logistics_PlanReady());
+  reset();manual();request(WEB_CMD_JOG,1,3,jog_values,4);
+  request(WEB_CMD_MANUAL_RELEASE,1,4);
+  CHECK(mode==WEB_MODE_IDLE && !jog_active && lastResult()==WEB_RESULT_OK);
   reset();manual();request(WEB_CMD_JOG,1,3,jog_values,4);taskRequest(4);
   CHECK(lastResult()==WEB_RESULT_INTERLOCK && jog_active && plan_set_calls==0 && !Logistics_PlanReady());
   /* Exercise actual controller dispatch and PWM channel, not a UI-only target. */
@@ -237,7 +289,7 @@ static void tests(){
   reset();manual();clock_ms+=WEB_STATUS_PERIOD_MS;request(WEB_CMD_HEARTBEAT,1,3);
   CHECK(replies.back().command==WEB_CMD_STATUS && replies.back().length==WEB_TASK_STATUS_SIZE && Web_Get16(replies.back().payload+16)==WEB_GIMBAL_UNKNOWN_ANGLE);
   reset();manual();request(WEB_CMD_JOG,1,3,jog_values,4);gimbalRequest(120,4);CHECK(lastResult()==WEB_RESULT_INTERLOCK && gimbal_count==0 && jog_active);
-  reset();manual();gimbalRequest(120,3);taskRequest(4);startRequest(5);CHECK(mode==WEB_MODE_AUTO && gimbal_target==WEB_GIMBAL_UNKNOWN_ANGLE);
+  reset();manual();gimbalRequest(120,3);taskRequest(4);startRequest(5);CHECK(RobotControl_IsAutomatic() && gimbal_target==WEB_GIMBAL_UNKNOWN_ANGLE);
   gimbalRequest(54,6);CHECK(lastResult()==WEB_RESULT_WRONG_MODE && gimbal_count==1);
   reset();manual();fail_gimbal_pwm=true;gimbalRequest(54,3);CHECK(lastResult()==WEB_RESULT_INTERLOCK && mode==WEB_MODE_IDLE && fault==WEB_FAULT_INTERLOCK && gimbal_target==WEB_GIMBAL_UNKNOWN_ANGLE);
   reset();manual();clock_ms+=WEB_STATUS_PERIOD_MS;request(WEB_CMD_HEARTBEAT,1,40000);CHECK(status_sequence>=1);uint16_t first=status_sequence;clock_ms+=WEB_STATUS_PERIOD_MS;request(WEB_CMD_HEARTBEAT,1,40001);CHECK(status_sequence==(uint16_t)(first+1));
@@ -294,7 +346,7 @@ static void tests(){
   reset();manual();manual_lift_active=1U;trayRequest(135,3);CHECK(tray_count==0 && mode==WEB_MODE_IDLE);
   reset();manual();fault=WEB_FAULT_INTERLOCK;trayRequest(135,3);CHECK(lastResult()==WEB_RESULT_INTERLOCK && tray_count==0);
   reset();manual();trayRequest(135,3);taskRequest(4);startRequest(5);
-  CHECK(mode==WEB_MODE_AUTO && tray_target==WEB_TRAY_UNKNOWN_ANGLE);
+  CHECK(RobotControl_IsAutomatic() && tray_target==WEB_TRAY_UNKNOWN_ANGLE);
   trayRequest(20,6);CHECK(lastResult()==WEB_RESULT_WRONG_MODE && tray_count==1);
   reset();manual();fail_tray_pwm=true;trayRequest(135,3);
   CHECK(lastResult()==WEB_RESULT_INTERLOCK && tray_count==1 && tray_target==WEB_TRAY_UNKNOWN_ANGLE && mode==WEB_MODE_IDLE && fault==WEB_FAULT_INTERLOCK);

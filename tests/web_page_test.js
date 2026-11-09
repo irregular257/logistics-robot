@@ -110,9 +110,11 @@ function harness() {
       }, { once: true });
     });
   }
-  function revoke() {
+  function revoke(stopAll = false) {
     server.state.claimed = server.state.mine = server.state.armed = server.state.pending = false;
-    server.state.mode = 0;
+    if (stopAll || server.state.mode === 1) server.state.mode = 0;
+    if (stopAll && server.state.autoState > 0) server.state.autoState = 14;
+    server.state.x = server.state.y = server.state.turn = server.state.lift = 0;
   }
   function fetchMock(url, options) {
     const request = {
@@ -147,8 +149,8 @@ function harness() {
       server.state.pending = true;
       return Promise.resolve(response({ ok: true, queued: true }, 202));
     }
-    if (url === '/api/stop' || url === '/api/release') {
-      revoke();
+    if (url === '/api/stop' || url === '/api/release' || url === '/api/manual-release') {
+      revoke(url === '/api/stop');
       return Promise.resolve(response({ ok: true }));
     }
     if (url === '/api/jog' && server.deferJog) {
@@ -208,7 +210,7 @@ function harness() {
     document, window, fetch: fetchMock, URLSearchParams, AbortController, Blob,
     Date: { now: () => now },
     navigator: {
-      sendBeacon(url) { requests.push({ path: url, beacon: true }); revoke(); return true; }
+      sendBeacon(url) { requests.push({ path: url, beacon: true }); revoke(url === '/api/stop'); return true; }
     },
     setInterval(fn, ms) { intervals.push({ fn, ms }); },
     setTimeout(fn, ms) { const id = ++timerId; timeouts.set(id, { fn, ms }); return id; },
@@ -369,7 +371,7 @@ test('Ping refreshes ownership without a sequence or movement command', async ()
   assert.equal(env.matching('/api/jog').length, count);
 });
 
-test('Background lifecycle sends one STOP, clears ownership and never auto-resumes', async () => {
+test('Background lifecycle releases manual control once and never resumes held motion', async () => {
   const env = harness();
   await env.manual();
   env.motion('forward').emit('pointerdown');
@@ -379,7 +381,8 @@ test('Background lifecycle sends one STOP, clears ownership and never auto-resum
   env.window.emit('pagehide');
   env.window.emit('blur');
   await env.flush();
-  assert.equal(env.matching('/api/stop').length, 1);
+  assert.equal(env.matching('/api/manual-release').length, 1);
+  assert.equal(env.matching('/api/stop').length, 0);
   assert.equal(env.elements.release.disabled, true);
   const jogCount = env.matching('/api/jog').length;
   const pingCount = env.matching('/api/ping').length;
@@ -405,7 +408,7 @@ test('The 500 ms JOG timeout stops the device and invalidates the token', async 
   await env.flush();
   assert.equal(env.elements.release.disabled, true);
   assert.equal(env.motion('right').disabled, true);
-  assert.equal(env.requests.at(-1).path, '/api/stop');
+  assert.equal(env.requests.at(-1).path, '/api/manual-release');
 });
 
 test('A status connection failure stops control', async () => {
@@ -416,7 +419,7 @@ test('A status connection failure stops control', async () => {
   assert.equal(env.elements.release.disabled, true);
   assert.equal(env.motion('forward').disabled, true);
   assert.equal(env.elements.gimbalApply.disabled, true);
-  assert.equal(env.requests.at(-1).path, '/api/stop');
+  assert.equal(env.requests.at(-1).path, '/api/manual-release');
 });
 
 test('A delayed unauthenticated status during claim cannot revoke the new token', async () => {
@@ -535,6 +538,45 @@ test('Automatic route requires setup confirmation, locks manual controls and can
   assert.equal(env.matching('/api/pause').length,1);
   assert(env.elements.autoStatus.textContent.includes('已停止'));
   assert.equal(env.elements.autoStart.disabled,true);
+});
+
+test('Closing or losing the page preserves automatic work before the START status arrives', async () => {
+  for (const event of ['blur', 'visibilitychange', 'pagehide', 'networkError', 'release']) {
+    const env = harness();
+    env.server.state.autoSupported = true;
+    env.server.state.taskAccepted = true;
+    env.server.state.taskPlan = [4,1,7,4,3,3];
+    await env.manual();
+    env.elements.positioned.checked = true;
+    env.elements.positioned.emit('change');
+    env.server.deferStatus = true;
+    env.elements.autoStart.emit('click');
+    await env.flush();
+    assert.equal(env.server.state.mode, 2, 'The controller has already accepted START');
+    assert.equal(env.elements.mode.textContent, '手动', 'The page still has the pre-START status');
+    const pendingStatus = env.matching('/api/status').at(-1);
+    if (event === 'visibilitychange') {
+      env.document.hidden = true;
+      env.document.emit(event);
+    } else if (event === 'networkError') {
+      pendingStatus.reject(new Error('Connection lost after START'));
+    } else if (event === 'release') {
+      env.elements.release.emit('click');
+    } else {
+      env.window.emit(event);
+    }
+    await env.flush();
+    assert.equal(env.matching('/api/stop').length, 0, event);
+    assert.equal(env.server.state.mode, 2, event);
+    assert.equal(env.server.state.autoState, 1, event);
+    assert.deepEqual(env.server.state.taskPlan, [4,1,7,4,3,3]);
+    assert.equal(env.server.state.claimed, false);
+    env.elements.stop.emit('click');
+    await env.flush();
+    assert.equal(env.matching('/api/stop').length, 1, 'Explicit STOP remains global after ownership is released');
+    assert.equal(env.server.state.mode, 0);
+    assert.equal(env.server.state.autoState, 14);
+  }
 });
 
 test('Gimbal requires manual ownership and the firmware capability', async () => {
@@ -663,13 +705,13 @@ test('Rejected servo ACK and missing ACK give actionable errors and revoke contr
   rejected.elements.gimbalExtend.emit('click'); await rejected.flush();
   await rejected.acknowledge(rejected.matching('/api/gimbal').at(-1), 5);
   assert(rejected.elements.notice.textContent.includes('运动互锁或设备状态不满足要求'));
-  assert.equal(rejected.matching('/api/stop').length, 1);
+  assert.equal(rejected.matching('/api/manual-release').length, 1);
   const timed = harness();
   await timed.manual();
   timed.elements.clawClose.emit('click'); await timed.flush();
   for (let i = 0; i < 5; ++i) await timed.tick(300);
   assert(timed.elements.notice.textContent.includes('夹爪指令没有收到主控确认'));
-  assert.equal(timed.matching('/api/stop').length, 1);
+  assert.equal(timed.matching('/api/manual-release').length, 1);
   assert.equal(timed.elements.clawOpen.disabled, true);
 });
 
@@ -889,7 +931,7 @@ test('Manual lift faults revoke ownership with a concrete diagnostic; no held mo
     await env.manual(); env.motion('liftUp').emit('pointerdown'); await env.flush();
     env.server.state.fault = fault; await env.tick(300);
     assert(env.elements.notice.textContent.includes(word));
-    assert.equal(env.matching('/api/stop').length, 1);
+    assert.equal(env.matching('/api/manual-release').length, 1);
     assert.equal(env.motion('liftUp').classes.has('pressed'), false);
     const count = env.matching('/api/jog').length;
     await env.tick(100);

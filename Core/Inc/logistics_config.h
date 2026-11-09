@@ -1,6 +1,17 @@
 #ifndef ROBOT_LOGISTICS_CONFIG_H
 #define ROBOT_LOGISTICS_CONFIG_H
 
+/* Enable only after pairing the external ESP-NOW table and configuring its
+ * motor. The existing fixed pickup station remains the default. */
+#ifndef LOG_EXTERNAL_TABLE_ENABLED
+#define LOG_EXTERNAL_TABLE_ENABLED  0
+#endif
+#define LOG_TABLE_STATUS_TIMEOUT_MS 300U
+#define LOG_TABLE_START_TIMEOUT_MS  3000U
+#define LOG_TABLE_HOLD_TIMEOUT_MS   1000U
+#define LOG_TABLE_PICK_TIMEOUT_MS   2000U
+#define LOG_TABLE_SEARCH_TIMEOUT_MS 120000U
+
 /* Metres. Car front points toward field +Y at start; X points right. */
 #define LOG_FIELD_M                 2.00f
 #define LOG_DOCK_MARGIN_M           0.30f

@@ -23,6 +23,30 @@
 #define WEB_CMD_CLAW_ANGLE 0x0BU
 #define WEB_CMD_SERVO_PRESETS 0x0CU
 #define WEB_CMD_TRAY_ANGLE 0x0DU
+#define WEB_CMD_MANUAL_RELEASE 0x0EU
+#define WEB_CMD_TABLE_STATUS 0x0FU
+#define WEB_CMD_TABLE_REQUEST 0x82U
+#define WEB_TABLE_REQUEST_SIZE 9U
+#define WEB_TABLE_STATUS_SIZE 15U
+#define WEB_TABLE_PERIOD_MS 50U
+#define WEB_TABLE_OP_START 1U
+#define WEB_TABLE_OP_HOLD 2U
+#define WEB_TABLE_OP_PICK_DONE 3U
+#define WEB_TABLE_OP_ABORT 4U
+#define WEB_TABLE_IDLE 0U
+#define WEB_TABLE_MOVING 1U
+#define WEB_TABLE_SETTLING 2U
+#define WEB_TABLE_READY 3U
+#define WEB_TABLE_HELD 4U
+#define WEB_TABLE_DONE 5U
+#define WEB_TABLE_FAULT 6U
+/* TABLE_REQUEST STM32->ESP32: [op,taskId LE32,window LE32]. Repeats every
+ * 50 ms; identical op/task/window requests MUST be idempotent at the bridge.
+ * TABLE_STATUS ESP32->STM32: [state,picked,fault,taskId LE32,window LE32,
+ * tableBoot LE32]. 50 ms fresh telemetry; nonzero fault on wireless loss.
+ * UART headers/session/sequence/CRC are unchanged. STATUS needs no UART ACK.
+ * HELD confirms completed stop at that exact task/window. Grasp never starts
+ * from a send-success callback. PICK_DONE follows arm clearance, once/item. */
 #define WEB_GIMBAL_MIN_ANGLE 0U
 #define WEB_GIMBAL_MAX_ANGLE 270U
 #define WEB_CLAW_MIN_ANGLE 0U
@@ -75,7 +99,9 @@
  * 30 bytes additionally advertises TRAY_ANGLE support; 0xFFFF means unknown.
  * STATUS extended to 32 bytes: original 30, task protocol version(1), plan ready(0/1).
  * The first/second/third loaded item goes to UL/UR/LR respectively.
- * A new UART session clears the plan; an old one-byte START is rejected.
+ * MANUAL_RELEASE: no payload; releases manual control only. Automatic execution
+ * and its plan persist across web sessions, heartbeats and reconnects.
+ * STOP/PAUSE explicitly cancel automatic execution. START requires all plan bytes.
  */
 typedef struct {
     uint32_t session;

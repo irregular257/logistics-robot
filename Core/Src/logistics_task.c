@@ -4,6 +4,8 @@
 #include "usart.h"
 #include "tim.h"
 #include "duiji.h"
+#include "motor_bus.h"
+#include "web_protocol.h"
 #include <math.h>
 #include <string.h>
 
@@ -25,6 +27,51 @@ static uint8_t lift_down;
 static Point target;
 static uint8_t plan[LOG_PLAN_BYTES], plan_ready;
 static const float tray_angles[3] = LOG_TRAY_SLOT_ANGLES;
+
+#if LOG_EXTERNAL_TABLE_ENABLED
+static volatile LogisticsTableRequest table_request;
+static volatile LogisticsTableStatus table_received;
+static LogisticsTableStatus table_sample;
+static uint32_t table_task_id, table_task_counter, table_window, table_boot;
+static uint32_t table_started_at, table_search_at;
+static uint8_t table_active, table_seen, table_require_held;
+
+static void table_set_request(uint8_t operation, uint32_t window)
+{
+    uint32_t saved=__get_PRIMASK();
+    __disable_irq();
+    table_request.task_id=table_task_id;
+    table_request.window=window;
+    table_request.operation=operation;
+    __set_PRIMASK(saved);
+}
+static void table_abort(void)
+{
+    if (table_active) table_set_request(WEB_TABLE_OP_ABORT,table_window);
+    table_active=table_require_held=0U;
+}
+uint8_t Logistics_TableReadRequest(LogisticsTableRequest *out)
+{
+    uint32_t saved;
+    if (!out) return 0U;
+    saved=__get_PRIMASK(); __disable_irq();
+    memcpy(out,(const void *)&table_request,sizeof(*out));
+    __set_PRIMASK(saved);
+    return out->operation!=0U;
+}
+void Logistics_TableReceive(const LogisticsTableStatus *status)
+{
+    uint32_t saved;
+    if (!status || status->state>WEB_TABLE_FAULT || status->picked>3U) return;
+    saved=__get_PRIMASK(); __disable_irq();
+    memcpy((void *)&table_received,status,sizeof(*status));
+    table_received.seen=1U;
+    __set_PRIMASK(saved);
+}
+#else
+uint8_t Logistics_TableReadRequest(LogisticsTableRequest *out) { (void)out; return 0U; }
+void Logistics_TableReceive(const LogisticsTableStatus *status) { (void)status; }
+#endif
 
 static uint8_t valid_plan(const uint8_t *items, uint8_t length)
 {
@@ -64,21 +111,21 @@ static float wrap(float a)
 { while (a > 180.0f) a -= 360.0f; while (a < -180.0f) a += 360.0f; return a; }
 static uint8_t send_motor(uint8_t *data, uint16_t size)
 {
-    uint8_t ok = HAL_UART_Transmit(&huart1,data,size,10U) == HAL_OK;
-    HAL_Delay(size >= 8U ? 10U : 1U);
-    return ok;
+    return MotorBus_Transmit(data, size, size >= 8U ? 10U : 1U);
 }
 static uint8_t stop_axes(uint8_t first, uint8_t last)
 {
     uint8_t id,ok=1U;
     uint8_t data[5]={0,0xFE,0x98,0,0x6B};
+    MotorBus_Begin();
     for (id=first;id<=last;++id) { data[0]=id; if (!send_motor(data,5)) ok=0U; }
+    MotorBus_End();
     return ok;
 }
 static uint8_t drive(float forward,float left,float omega)
 {
     float wheels[4],rpm;
-    uint8_t id;
+    uint8_t id, ok=1U;
     uint8_t data[8]={0,0xF6,0,0,0,0,1,0x6B};
     uint8_t sync[4]={0,0xFF,0x66,0x6B};
     if (forward==0.0f && left==0.0f && omega==0.0f) {
@@ -92,23 +139,74 @@ static uint8_t drive(float forward,float left,float omega)
     wheels[1]=-(forward+left+omega);
     wheels[2]=forward+left-omega;
     wheels[3]=-(forward-left+omega);
+    MotorBus_Begin();
     for (id=0;id<4;++id) {
         uint16_t speed;
         rpm=fabsf(wheels[id]); speed=(uint16_t)(rpm+0.5f);
         data[0]=id+1; data[2]=wheels[id]<0.0f ? 1U : 0U;
         data[3]=(uint8_t)(speed>>8); data[4]=(uint8_t)speed;
-        if (!send_motor(data,8)) return 0U;
+        if (!send_motor(data,8)) { ok=0U; break; }
     }
-    return send_motor(sync,4);
+    if (ok) ok=send_motor(sync,4);
+    MotorBus_End();
+    return ok;
 }
 static void fail(uint8_t reason)
 {
+#if LOG_EXTERNAL_TABLE_ENABLED
+    table_abort();
+#endif
     logistics_error=reason; logistics_state=LOG_FAULT;
     (void)stop_axes(1,5); stopped=1U;
     (void)VisionObserve_Stop();
 }
 static void enter(uint8_t state)
 { logistics_state=state; enter_tick=HAL_GetTick(); stable=0U; }
+
+#if LOG_EXTERNAL_TABLE_ENABLED
+/* A stale or rebooted table can never authorize a grip. Check before the
+ * normal 70 ms motion gate, including while the lift is already moving. */
+static uint8_t table_watch(void)
+{
+    uint32_t now,saved;
+    if (!table_active) return 1U;
+    saved=__get_PRIMASK(); __disable_irq();
+    memcpy(&table_sample,(const void *)&table_received,sizeof(table_sample));
+    __set_PRIMASK(saved);
+    now=HAL_GetTick();
+    if (!table_sample.seen || table_sample.task_id!=table_task_id) {
+        if (table_seen || (uint32_t)(now-table_started_at)>LOG_TABLE_START_TIMEOUT_MS)
+            fail(LOG_ERROR_TABLE_LINK);
+        return logistics_state!=LOG_FAULT;
+    }
+    if ((uint32_t)(now-table_sample.received_at)>LOG_TABLE_STATUS_TIMEOUT_MS ||
+        table_sample.fault || !table_sample.boot_id) {
+        fail(LOG_ERROR_TABLE_LINK); return 0U;
+    }
+    if (table_seen && table_sample.boot_id!=table_boot) {
+        fail(LOG_ERROR_TABLE_LINK); return 0U;
+    }
+    table_boot=table_sample.boot_id; table_seen=1U;
+    if (table_sample.state==WEB_TABLE_FAULT ||
+        (table_require_held && (table_sample.state!=WEB_TABLE_HELD ||
+         table_sample.window!=table_window || table_sample.picked!=loaded_count))) {
+        fail(LOG_ERROR_TABLE_STATE); return 0U;
+    }
+    return 1U;
+}
+static uint8_t table_has_status(void)
+{
+    return table_sample.seen && table_sample.task_id==table_task_id &&
+           (uint32_t)(HAL_GetTick()-table_sample.received_at)<=LOG_TABLE_STATUS_TIMEOUT_MS;
+}
+static void table_wait_ready(void)
+{
+    (void)VisionObserve_Stop();
+    table_require_held=0U;
+    table_set_request(WEB_TABLE_OP_START,0U);
+    enter(LOG_TABLE_WAIT_READY);
+}
+#endif
 
 void Logistics_MotorRxByteISR(uint8_t byte)
 {
@@ -272,8 +370,13 @@ static void prepare(void)
 {
     enter(LOG_PREPARE);
     YunTai(Duoji_GetGimbalPreset(1U)); ZhuanPan(tray_angles[logistics_drop_index]); ZhuaZi(Duoji_GetClawPreset(1U));
+#if LOG_EXTERNAL_TABLE_ENABLED
+    table_search_at=HAL_GetTick();
+    (void)VisionObserve_Stop();
+#else
     if (!VisionObserve_StartTarget(plan[2U*logistics_drop_index],
                                   plan[2U*logistics_drop_index+1U])) fail(LOG_ERROR_MOTOR_UART);
+#endif
 }
 void Logistics_Init(void)
 {
@@ -282,11 +385,18 @@ void Logistics_Init(void)
     logistics_state=LOG_IDLE; logistics_drop_index=logistics_error=0;
     memset(plan,0,sizeof(plan)); plan_ready=0U;
     loaded_count=0U;
+#if LOG_EXTERNAL_TABLE_ENABLED
+    memset((void *)&table_request,0,sizeof(table_request));
+    memset((void *)&table_received,0,sizeof(table_received));
+    memset(&table_sample,0,sizeof(table_sample));
+    table_active=table_seen=table_require_held=0U;
+    table_task_counter=HAL_GetTick() ^ 0x54420000U;
+#endif
     logistics_x_m=LOG_PICK_X_M; logistics_y_m=LOG_PICK_Y_M; stopped=1;
 }
 uint8_t Logistics_IsRunning(void)
 { return (logistics_state>=LOG_PREPARE && logistics_state<=LOG_RETURN) ||
-         (logistics_state>=LOG_STORE_LOWER && logistics_state<=LOG_DELIVERY_FOLD); }
+         (logistics_state>=LOG_STORE_LOWER && logistics_state<=LOG_TABLE_WAIT_PICK); }
 uint8_t Logistics_Start(void)
 {
     uint8_t i;
@@ -306,11 +416,21 @@ uint8_t Logistics_Start(void)
         Duoji_StartPWM(TIM_CHANNEL_2)!=HAL_OK ||
         Duoji_StartPWM(TIM_CHANNEL_3)!=HAL_OK) { fail(LOG_ERROR_SERVO); return 0U; }
     control_tick=now;
+#if LOG_EXTERNAL_TABLE_ENABLED
+    do { ++table_task_counter; } while (!table_task_counter);
+    table_task_id=table_task_counter; table_window=table_boot=0U;
+    table_active=1U; table_seen=table_require_held=0U;
+    table_started_at=HAL_GetTick();
+    table_set_request(WEB_TABLE_OP_START,0U);
+#endif
     prepare(); return Logistics_IsRunning();
 }
 void Logistics_Cancel(void)
 {
     if (!Logistics_IsRunning()) return;
+#if LOG_EXTERNAL_TABLE_ENABLED
+    table_abort();
+#endif
     logistics_state=LOG_ABORTED;
     (void)stop_axes(1,5); stopped=1U;
     (void)VisionObserve_Stop();
@@ -325,6 +445,9 @@ void Logistics_Task(void)
         if (!send_motor(data,3) && Logistics_IsRunning()) { fail(LOG_ERROR_MOTOR_UART); return; }
     }
     if (!Logistics_IsRunning()) return;
+#if LOG_EXTERNAL_TABLE_ENABLED
+    if (!table_watch()) return;
+#endif
     read_snapshot();
     /* A reply can arrive during the poll above. Take time AFTER copying its
      * timestamp, otherwise unsigned age underflows across a SysTick edge. */
@@ -337,8 +460,65 @@ void Logistics_Task(void)
     fresh=integrate();
     switch (logistics_state) {
     case LOG_PREPARE:
-        if ((uint32_t)(now-enter_tick)>=LOG_SERVO_WAIT_MS) { enter(LOG_ALIGN); stable_vision_tick=0U; }
+        if ((uint32_t)(now-enter_tick)>=LOG_SERVO_WAIT_MS) {
+#if LOG_EXTERNAL_TABLE_ENABLED
+            enter(LOG_TABLE_WAIT_READY);
+#else
+            enter(LOG_ALIGN); stable_vision_tick=0U;
+#endif
+        }
         break;
+#if LOG_EXTERNAL_TABLE_ENABLED
+    case LOG_TABLE_WAIT_READY:
+        if ((uint32_t)(now-table_search_at)>LOG_TABLE_SEARCH_TIMEOUT_MS) { fail(LOG_ERROR_TABLE_TIMEOUT); break; }
+        if (table_has_status() && table_sample.state==WEB_TABLE_READY &&
+            table_sample.picked==loaded_count && table_sample.window && table_sample.window!=table_window) {
+            table_window=table_sample.window;
+            /* A new token and a K230 tracker reset exclude the preceding
+             * sector's queued frames from the new observation window. */
+            if (!VisionObserve_Stop() || !VisionObserve_StartTarget(plan[2U*logistics_drop_index],
+                    plan[2U*logistics_drop_index+1U])) { fail(LOG_ERROR_MOTOR_UART); break; }
+            enter(LOG_TABLE_SCAN);
+        }
+        break;
+    case LOG_TABLE_SCAN: {
+        VisionObservation sample;
+        if ((uint32_t)(now-table_search_at)>LOG_TABLE_SEARCH_TIMEOUT_MS) { fail(LOG_ERROR_TABLE_TIMEOUT); break; }
+        if (!table_has_status() || table_sample.state!=WEB_TABLE_READY || table_sample.window!=table_window) {
+            table_wait_ready(); break;
+        }
+        if (VisionObserve_Read(&sample,LOG_VISION_TIMEOUT_MS) &&
+            sample.color==plan[2U*logistics_drop_index] && sample.shape==plan[2U*logistics_drop_index+1U]) {
+            table_set_request(WEB_TABLE_OP_HOLD,table_window);
+            enter(LOG_TABLE_WAIT_HELD);
+        }
+        break;
+    }
+    case LOG_TABLE_WAIT_HELD:
+        if (table_has_status() && table_sample.state==WEB_TABLE_HELD &&
+            table_sample.window==table_window && table_sample.picked==loaded_count) {
+            table_require_held=1U; stable_vision_tick=0U; enter(LOG_ALIGN);
+        } else if (table_has_status() &&
+                   (table_sample.state==WEB_TABLE_MOVING || table_sample.state==WEB_TABLE_SETTLING ||
+                    (table_sample.state==WEB_TABLE_READY && table_sample.window!=table_window))) {
+            /* HOLD arrived after the two-second boundary: scan another
+             * sector instead of gripping the object that has moved away. */
+            table_wait_ready();
+        } else if ((uint32_t)(now-enter_tick)>LOG_TABLE_HOLD_TIMEOUT_MS) fail(LOG_ERROR_TABLE_TIMEOUT);
+        break;
+    case LOG_TABLE_WAIT_PICK:
+        if (table_has_status() && table_sample.picked==loaded_count &&
+            (loaded_count<3U || table_sample.state==WEB_TABLE_DONE)) {
+            if (loaded_count==3U) {
+                table_active=0U; table_set_request(0U,0U);
+                logistics_drop_index=0U; begin_route(0);
+            } else {
+                table_set_request(WEB_TABLE_OP_START,0U);
+                YunTai(Duoji_GetGimbalPreset(1U)); enter(LOG_LOAD_CLEAR);
+            }
+        } else if ((uint32_t)(now-enter_tick)>LOG_TABLE_PICK_TIMEOUT_MS) fail(LOG_ERROR_TABLE_TIMEOUT);
+        break;
+#endif
     case LOG_ALIGN: {
         VisionObservation sample; float ex,ey,forward,left,speed;
         if ((uint32_t)(now-enter_tick)>LOG_ALIGN_TIMEOUT_MS) { fail(LOG_ERROR_VISION); break; }
@@ -387,8 +567,16 @@ void Logistics_Task(void)
     case LOG_STORE_RAISE:
         if (lift_step(now)) {
             ++loaded_count;
+#if LOG_EXTERNAL_TABLE_ENABLED
+            /* Retracted arm, stored cargo and raised lift: rotation can
+             * resume only after this physical clearance, not on detection. */
+            table_require_held=0U;
+            table_set_request(WEB_TABLE_OP_PICK_DONE,table_window);
+            enter(LOG_TABLE_WAIT_PICK);
+#else
             if (loaded_count==3U) { logistics_drop_index=0U; begin_route(0); }
             else { YunTai(Duoji_GetGimbalPreset(1U)); enter(LOG_LOAD_CLEAR); }
+#endif
         }
         break;
     case LOG_LOAD_CLEAR:

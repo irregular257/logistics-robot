@@ -13,6 +13,7 @@
 #include "control_state.h"
 #include "uart_parser.h"
 #include "web_page.h"
+#include "table_bridge.h"
 
 const char *AP_SSID = "Robot-Car";
 const char *AP_PASSWORD = "robot12345"; // At least 8 characters.
@@ -23,6 +24,8 @@ WebServer server(80);
 BrowserControl control;
 UartParser parser;
 Preferences servoPreferences;
+TableBridge tableBridge;
+uint32_t tableStatusAt = 0;
 
 uint32_t uartSession = 0;
 uint16_t uartSequence = 0;
@@ -72,7 +75,7 @@ uint16_t sendFrame(uint8_t command, const uint8_t *payload = nullptr, uint8_t le
   WebFrame frame = {};
   frame.session = uartSession; frame.sequence = ++uartSequence;
   frame.command = command; frame.length = length;
-  if (command != WEB_CMD_HELLO && command != WEB_CMD_HEARTBEAT) {
+  if (command != WEB_CMD_HELLO && command != WEB_CMD_HEARTBEAT && command != WEB_CMD_TABLE_STATUS) {
     operationSequence = frame.sequence; operationCommand = command; ackReceived = false;
   }
   if (length) memcpy(frame.payload, payload, length);
@@ -84,7 +87,12 @@ void stopAndRevoke() {
   taskPending = false;
   control.clear(); sendFrame(WEB_CMD_STOP);
 }
+void releaseManualAndRevoke() {
+  taskPending = false;
+  control.clear(); sendFrame(WEB_CMD_MANUAL_RELEASE);
+}
 void beginSession() {
+  tableBridge.onUartSession();
   uartSession = randomNonzero(); uartSequence = 0;
   helloAccepted = false; statusReceived = false; haveStatusSequence = false;
   stmMode = WEB_MODE_IDLE; stmFault = 0; liftEnabled = false; ackReceived = false;
@@ -103,6 +111,7 @@ bool newer16(uint16_t value, uint16_t previous) {
 }
 void receiveFrame(const WebFrame &frame) {
   if (frame.session != uartSession) return;
+  if (frame.command == WEB_CMD_TABLE_REQUEST) { tableBridge.onRequest(frame); return; }
   if (frame.command == WEB_CMD_ACK && frame.length == 4) {
     uint8_t command = frame.payload[0], result = frame.payload[1];
     if (command == WEB_CMD_HELLO && result == WEB_RESULT_OK)
@@ -132,7 +141,7 @@ void receiveFrame(const WebFrame &frame) {
     if (command == WEB_CMD_MODE && control.armPending && frame.sequence == control.armSequence) {
       bool ok = result == WEB_RESULT_OK && frame.payload[2] == WEB_MODE_MANUAL &&
                 frame.payload[3] == 0 && freshStatus();
-      if (control.acceptArmAck(frame.sequence, ok, millis()) && !ok) stopAndRevoke();
+      if (control.acceptArmAck(frame.sequence, ok, millis()) && !ok) releaseManualAndRevoke();
     }
   } else if (frame.command == WEB_CMD_STATUS && (frame.length == 8 || frame.length == 16 || frame.length == 18 || frame.length == WEB_SERVO_STATUS_SIZE || frame.length == WEB_TRAY_STATUS_SIZE || frame.length == WEB_TASK_STATUS_SIZE)) {
     if (haveStatusSequence && !newer16(frame.sequence, statusSequence)) return;
@@ -169,7 +178,7 @@ void receiveFrame(const WebFrame &frame) {
     traySupported = frame.length >= WEB_TRAY_STATUS_SIZE;
     uint16_t trayTarget = traySupported ? Web_Get16(frame.payload + 28) : WEB_TRAY_UNKNOWN_ANGLE;
     trayAngle = trayTarget <= WEB_TRAY_MAX_ANGLE ? (int16_t)trayTarget : -1;
-    if (control.armed && (stmMode != WEB_MODE_MANUAL || stmFault)) stopAndRevoke();
+    if (control.armed && (stmMode != WEB_MODE_MANUAL || stmFault)) releaseManualAndRevoke();
   }
 }
 void serviceUart() {
@@ -226,7 +235,7 @@ void replyQueued(uint16_t sequence) {
   server.send(202, "application/json", String("{\"ok\":true,\"queued\":true,\"uartSeq\":") + sequence + "}");
 }
 bool ownerRequired(bool ordered) {
-  if (control.expired(millis())) stopAndRevoke();
+  if (control.expired(millis())) releaseManualAndRevoke();
   uint64_t token = requestToken();
   if (!control.owns(token)) { replyError(403, "请先申请控制权"); return false; }
   if (ordered) {
@@ -317,7 +326,7 @@ void handleStatus() {
 }
 void handleClaim() {
   if (!linkRequired()) return;
-  if (control.expired(millis())) stopAndRevoke();
+  if (control.expired(millis())) releaseManualAndRevoke();
   if (control.token) { replyError(409, "已有浏览器控制，请先释放控制权"); return; }
   if (presetsPending) { replyError(409, "正在恢复已保存的舵机角度，请稍后申请"); return; }
   uint64_t token = ((uint64_t)randomNonzero() << 32) | randomNonzero();
@@ -330,8 +339,9 @@ void handleMode() {
   if (!ownerRequired(true) || !linkRequired()) return;
   int32_t value;
   if (!parseInteger(server.arg("value"), 0, 1, value)) { replyError(400, "模式无效"); return; }
-  if (!value) { stopAndRevoke(); server.send(200, "application/json", "{\"ok\":true}"); return; }
+  if (!value) { releaseManualAndRevoke(); server.send(200, "application/json", "{\"ok\":true}"); return; }
   if (control.armPending) { replyError(409, "等待主控确认"); return; }
+  if (stmMode == WEB_MODE_AUTO) { replyError(409, "自动任务运行中，请先停止自动任务"); return; }
   if (stmFault) { replyError(409, "主控故障，请等待链路恢复后重新申请"); return; }
   control.armed = false; control.moving = false;
   uint8_t mode = WEB_MODE_MANUAL;
@@ -482,10 +492,16 @@ void setup() {
     for (int i = 0; i < 4; ++i) if (savedPresets[i] > 270U) savedPresetsValid = false;
   }
   StmSerial.setRxBufferSize(512); StmSerial.begin(115200, SERIAL_8N1, STM_RX_PIN, STM_TX_PIN);
-  WiFi.mode(WIFI_AP); WiFi.softAPConfig(IPAddress(192,168,4,1), IPAddress(192,168,4,1), IPAddress(255,255,255,0));
+#if TABLE_NOW_ENABLED
+  WiFi.mode(WIFI_AP_STA);
+#else
+  WiFi.mode(WIFI_AP);
+#endif
+  WiFi.softAPConfig(IPAddress(192,168,4,1), IPAddress(192,168,4,1), IPAddress(255,255,255,0));
   if (!WiFi.softAP(AP_SSID, AP_PASSWORD, 1, false, 4)) {
     Serial.println("Failed to start AP"); return;
   }
+  tableBridge.begin();
   const char *headers[] = {"X-Token"}; server.collectHeaders(headers, 1);
   server.on("/", HTTP_GET, []() { server.sendHeader("Cache-Control", "no-store"); server.send_P(200, "text/html; charset=utf-8", WEB_PAGE); });
   server.on("/api/status", HTTP_GET, handleStatus);
@@ -500,7 +516,8 @@ void setup() {
   server.on("/api/servo-presets", HTTP_POST, handleServoPresets);
   server.on("/api/task", HTTP_POST, handleTask);
   server.on("/api/stop", HTTP_POST, []() { stopAndRevoke(); server.send(200, "application/json", "{\"ok\":true,\"stopped\":true}"); });
-  server.on("/api/release", HTTP_POST, []() { if (ownerRequired(false)) { stopAndRevoke(); server.send(200, "application/json", "{\"ok\":true}"); } });
+  server.on("/api/manual-release", HTTP_POST, []() { releaseManualAndRevoke(); server.send(200, "application/json", "{\"ok\":true}"); });
+  server.on("/api/release", HTTP_POST, []() { if (ownerRequired(false)) { releaseManualAndRevoke(); server.send(200, "application/json", "{\"ok\":true}"); } });
   server.on("/api/start", HTTP_POST, handleStart);
   server.on("/api/pause", HTTP_POST, handlePause);
   server.onNotFound([]() { replyError(404, "接口不存在"); });
@@ -509,15 +526,20 @@ void setup() {
 }
 void loop() {
   serviceUart();
+  tableBridge.tick(freshStatus());
   uint32_t now = millis();
-  if (control.expired(now) || control.jogExpired(now) || control.armExpired(now)) stopAndRevoke();
+  if (control.expired(now) || control.jogExpired(now) || control.armExpired(now)) releaseManualAndRevoke();
   if (helloAccepted && (uint32_t)(now - statusAt) >= 600U) {
-    stopAndRevoke(); beginSession();
+    releaseManualAndRevoke(); beginSession();
   }
   if (!helloAccepted && (uint32_t)(now - helloAt) >= 400U) {
     helloAt = now; sendFrame(WEB_CMD_HELLO);
   } else if (helloAccepted && (uint32_t)(now - heartbeatAt) >= 100U) {
     heartbeatAt = now; sendFrame(WEB_CMD_HEARTBEAT);
+  }
+  if (tableBridge.active() && helloAccepted && (uint32_t)(now - tableStatusAt) >= 50U) {
+    uint8_t payload[15]; tableBridge.fillStatus(payload);
+    tableStatusAt = now; sendFrame(WEB_CMD_TABLE_STATUS, payload, sizeof(payload));
   }
   serviceTask(); servicePresets(); server.handleClient(); serviceUart(); delay(1);
 }

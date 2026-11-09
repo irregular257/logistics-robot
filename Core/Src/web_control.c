@@ -3,8 +3,10 @@
 #include "usart.h"
 #include "tim.h"
 #include "duiji.h"
-#include "vision_follow.h"
+#include "logistics_config.h"
 #include "logistics_task.h"
+#include "robot_control.h"
+#include "motor_bus.h"
 #include <math.h>
 #include <string.h>
 
@@ -16,8 +18,6 @@
 #define RX_FAULT_OVERFLOW 1U
 #define RX_FAULT_UART 2U
 
-extern int start, zero;
-
 static uint8_t rx_byte;
 static uint8_t rx_bytes[RX_CAPACITY];
 static uint32_t rx_ticks[RX_CAPACITY];
@@ -27,6 +27,9 @@ static uint8_t parser[WEB_MAX_FRAME];
 static uint8_t parser_count;
 static uint32_t parser_tick;
 static uint32_t active_session, link_tick, jog_tick, motor_tick, status_tick;
+#if LOG_EXTERNAL_TABLE_ENABLED
+static uint32_t table_request_tick;
+#endif
 static uint16_t highest_sequence, status_sequence;
 static uint8_t session_valid, mode, fault, claw_target = 2U, jog_active;
 static uint8_t motion_dirty;
@@ -71,11 +74,10 @@ static void discard_rx(void)
  * Its immediate-stop command includes the sync flag:
  * [address, FE, 98, sync(0=immediate), 6B]. It also cancels position motion.
  * All five axes are stopped, including finite manual lift motion. */
-static uint8_t motor_send(uint8_t *data, uint8_t size)
+static uint8_t motor_send(const uint8_t *data, uint8_t size, uint32_t gap_ms)
 {
-    uint8_t ok = HAL_UART_Transmit(&huart1, data, size, 10U) == HAL_OK;
+    uint8_t ok = MotorBus_Transmit(data, size, gap_ms);
     if (!ok) fault = WEB_FAULT_MOTOR_UART;
-    HAL_Delay(1U);
     return ok;
 }
 
@@ -86,8 +88,7 @@ static uint8_t bounded_speed(uint8_t id, uint8_t direction, uint16_t rpm, uint8_
     uint8_t ok;
     uint8_t command[8] = {id, 0xF6U, direction, (uint8_t)(rpm >> 8),
                          (uint8_t)rpm, accel, 1U, 0x6BU};
-    ok = motor_send(command, sizeof(command));
-    HAL_Delay(9U); /* preserve the legacy speed command's 10 ms frame gap */
+    ok = motor_send(command, sizeof(command), 10U);
     return ok;
 }
 
@@ -95,8 +96,7 @@ static uint8_t bounded_sync(void)
 {
     uint8_t ok;
     uint8_t command[4] = {0U, 0xFFU, 0x66U, 0x6BU};
-    ok = motor_send(command, sizeof(command));
-    HAL_Delay(9U); /* preserve the legacy sync command's 10 ms frame gap */
+    ok = motor_send(command, sizeof(command), 10U);
     return ok;
 }
 
@@ -109,33 +109,32 @@ static uint8_t stop_all(void)
     motion_dirty = 0U;
     manual_lift_active = 0U;
     memset(jog, 0, sizeof(jog));
+    if (RobotControl_IsAutomatic()) return 1U;
+    MotorBus_Begin();
     for (id = 1U; id <= 5U; ++id) {
         command[0] = id;
-        if (!motor_send(command, sizeof(command))) ok = 0U;
+        if (!motor_send(command, sizeof(command), 1U)) ok = 0U;
     }
     /* Zero-speed commands are an additional fallback, not the position cancel. */
     for (id = 1U; id <= 5U; ++id)
         if (!bounded_speed(id, 0U, 0U, 0U)) ok = 0U;
     if (!bounded_sync()) ok = 0U;
+    MotorBus_End();
     return ok;
 }
 
 static void stop_idle(uint8_t reason)
 {
-    Logistics_Cancel();
     manual_lift_latched = 0U;
     mode = WEB_MODE_IDLE;
     fault = reason;
     (void)stop_all();
-    start = 0;
-    zero = 0;
-    vision_follow_enable = 0U;
 }
 
 static uint8_t lift_feedback(int64_t *count, uint32_t *serial)
 {
     uint32_t tick;
-    if (!Logistics_GetLiftFeedback(count, &tick, serial)) return 0U;
+    if (!RobotControl_GetLiftFeedback(count, &tick, serial)) return 0U;
     /* Read time after copying ISR data so a new sample cannot appear future. */
     return (uint32_t)(HAL_GetTick() - tick) < WEB_LIFT_FEEDBACK_TIMEOUT_MS;
 }
@@ -144,13 +143,14 @@ static uint8_t lift_available(void)
 {
     int64_t count;
     uint32_t serial;
-    return WEB_LIFT_JOG_ENABLED && fault == WEB_FAULT_NONE &&
+    return !RobotControl_IsAutomatic() && WEB_LIFT_JOG_ENABLED && fault == WEB_FAULT_NONE &&
            lift_feedback(&count, &serial);
 }
 
 static uint8_t begin_manual_lift(void)
 {
     uint32_t pulse, serial;
+    uint8_t ok;
     int64_t count;
     uint8_t command[13] = {5U, 0xFDU, 0U, 0U, 0U, WEB_LIFT_ACCEL,
                            0U, 0U, 0U, 0U, 0U, 1U, 0x6BU};
@@ -171,7 +171,10 @@ static uint8_t begin_manual_lift(void)
     command[8] = (uint8_t)(pulse >> 8); command[9] = (uint8_t)pulse;
     /* A finite relative position request provides a second motion bound.
      * Repeated web JOGs only renew the lease, never issue another position. */
-    if (!motor_send(command, sizeof(command)) || !bounded_sync()) return 0U;
+    MotorBus_Begin();
+    ok = motor_send(command, sizeof(command), 1U) && bounded_sync();
+    MotorBus_End();
+    if (!ok) return 0U;
     manual_lift_active = manual_lift_latched = 1U;
     return 1U;
 }
@@ -228,20 +231,41 @@ static void send_frame(const WebFrame *frame)
 static void send_ack(const WebFrame *request, uint8_t result)
 {
     WebFrame reply;
+    RobotStatus status;
     reply.session = request->session;
     reply.sequence = request->sequence;
     reply.command = WEB_CMD_ACK;
     reply.length = 4U;
     reply.payload[0] = request->command;
     reply.payload[1] = result;
-    reply.payload[2] = mode;
-    reply.payload[3] = fault;
+    RobotControl_ReadStatus(&status);
+    reply.payload[2] = status.running ? WEB_MODE_AUTO : mode;
+    reply.payload[3] = status.error && mode != WEB_MODE_MANUAL ? WEB_FAULT_AUTOMATIC :
+                       status.running ? WEB_FAULT_NONE : fault;
     send_frame(&reply);
 }
+
+#if LOG_EXTERNAL_TABLE_ENABLED
+static void send_table_request(uint32_t now)
+{
+    LogisticsTableRequest request;
+    WebFrame frame;
+    if (!session_valid || (uint32_t)(now-table_request_tick)<WEB_TABLE_PERIOD_MS ||
+        !Logistics_TableReadRequest(&request)) return;
+    table_request_tick=now;
+    frame.session=active_session; frame.sequence=status_sequence++;
+    frame.command=WEB_CMD_TABLE_REQUEST; frame.length=WEB_TABLE_REQUEST_SIZE;
+    frame.payload[0]=request.operation;
+    Web_Put32(frame.payload+1,request.task_id);
+    Web_Put32(frame.payload+5,request.window);
+    send_frame(&frame);
+}
+#endif
 
 static void send_status(uint32_t now)
 {
     WebFrame reply;
+    RobotStatus status;
     uint8_t i;
     if (!session_valid || (uint32_t)(now - status_tick) < WEB_STATUS_PERIOD_MS)
         return;
@@ -250,17 +274,19 @@ static void send_status(uint32_t now)
     reply.sequence = status_sequence++;
     reply.command = WEB_CMD_STATUS;
     reply.length = WEB_TASK_STATUS_SIZE;
-    reply.payload[0] = mode;
-    reply.payload[1] = fault;
+    RobotControl_ReadStatus(&status);
+    reply.payload[0] = status.running ? WEB_MODE_AUTO : mode;
+    reply.payload[1] = status.error && mode != WEB_MODE_MANUAL ? WEB_FAULT_AUTOMATIC :
+                       status.running ? WEB_FAULT_NONE : fault;
     reply.payload[2] = claw_target; /* commanded target, never grip feedback */
     reply.payload[3] = lift_available() ? 1U : 0U;
     for (i = 0U; i < 4U; ++i) reply.payload[4U + i] = (uint8_t)jog[i];
-    reply.payload[8]=logistics_state;
-    reply.payload[9]=logistics_drop_index;
-    reply.payload[10]=logistics_error;
+    reply.payload[8]=status.state;
+    reply.payload[9]=status.drop_index;
+    reply.payload[10]=status.error;
     reply.payload[11]=1U;
-    Web_Put16(reply.payload+12,(uint16_t)(int16_t)(logistics_x_m*100.0f));
-    Web_Put16(reply.payload+14,(uint16_t)(int16_t)(logistics_y_m*100.0f));
+    Web_Put16(reply.payload+12,(uint16_t)(int16_t)(status.x_m*100.0f));
+    Web_Put16(reply.payload+14,(uint16_t)(int16_t)(status.y_m*100.0f));
     Web_Put16(reply.payload+16,gimbal_target); /* target, not measured position */
     Web_Put16(reply.payload+18,claw_angle_target);
     Web_Put16(reply.payload+20,Duoji_GetClawPreset(0U));
@@ -269,7 +295,7 @@ static void send_status(uint32_t now)
     Web_Put16(reply.payload+26,Duoji_GetGimbalPreset(1U));
     Web_Put16(reply.payload+28,tray_target); /* target, not measured position */
     reply.payload[30] = WEB_TASK_PROTOCOL_VERSION;
-    reply.payload[31] = Logistics_PlanReady();
+    reply.payload[31] = status.plan_ready;
     send_frame(&reply);
 }
 
@@ -318,7 +344,7 @@ static void finish_jog_ack(uint8_t result)
 
 static uint8_t apply_motion(void)
 {
-    uint8_t i;
+    uint8_t i, ok = 1U;
     float forward, left, rotation, wheel[4], magnitude;
 #if WEB_LIFT_JOG_ENABLED
     if (jog[3] != 0) {
@@ -337,12 +363,18 @@ static uint8_t apply_motion(void)
     wheel[1] = -(forward + left + rotation);
     wheel[2] = forward - left + rotation;
     wheel[3] = -(forward + left - rotation);
+    MotorBus_Begin();
     for (i = 0U; i < 4U; ++i) {
         magnitude = fabsf(wheel[i]);
         if (!bounded_speed((uint8_t)(i + 1U), wheel[i] < 0.0f ? 1U : 0U,
-                           (uint16_t)magnitude, WEB_CHASSIS_ACCEL)) return 0U;
+                           (uint16_t)magnitude, WEB_CHASSIS_ACCEL)) {
+            ok = 0U;
+            break;
+        }
     }
-    return bounded_sync();
+    if (ok) ok = bounded_sync();
+    MotorBus_End();
+    return ok;
 }
 
 static void handle_frame(const WebFrame *request, uint32_t received_at)
@@ -353,9 +385,11 @@ static void handle_frame(const WebFrame *request, uint32_t received_at)
     int duplicate;
     int8_t next_jog[4];
 
-    /* STOP is unconditional for every CRC-valid protocol frame, even with
-     * an old session/sequence or malformed payload. It never arms a session. */
-    if (request->command == WEB_CMD_STOP) {
+    /* Explicit STOP cancels the automatic task. Session cleanup uses
+     * MANUAL_RELEASE, which only releases manual control. Both can stop stale
+     * manual commands without arming a new session. */
+    if (request->command == WEB_CMD_STOP || request->command == WEB_CMD_MANUAL_RELEASE) {
+        if (request->command == WEB_CMD_STOP) result = RobotControl_Stop();
         stop_idle(WEB_FAULT_NONE);
         finish_jog_ack(WEB_RESULT_INTERLOCK);
         if (fault == WEB_FAULT_MOTOR_UART) result = WEB_RESULT_INTERLOCK;
@@ -383,7 +417,6 @@ static void handle_frame(const WebFrame *request, uint32_t received_at)
         }
         stop_idle(WEB_FAULT_NONE);
         pending_jog_valid = 0U;
-        Logistics_ClearPlan();
         discard_rx(); /* old queued actions must never follow a new handshake */
         active_session = request->session;
         highest_sequence = request->sequence;
@@ -411,6 +444,22 @@ static void handle_frame(const WebFrame *request, uint32_t received_at)
     }
     highest_sequence = request->sequence;
 
+#if LOG_EXTERNAL_TABLE_ENABLED
+    if (request->command==WEB_CMD_TABLE_STATUS) {
+        LogisticsTableStatus status;
+        if (request->length!=WEB_TABLE_STATUS_SIZE || request->payload[0]>WEB_TABLE_FAULT ||
+            request->payload[1]>3U) return;
+        status.state=request->payload[0]; status.picked=request->payload[1];
+        status.fault=request->payload[2]; status.task_id=Web_Get32(request->payload+3);
+        status.window=Web_Get32(request->payload+7); status.boot_id=Web_Get32(request->payload+11);
+        status.received_at=received_at; status.seen=1U;
+        Logistics_TableReceive(&status);
+        /* Telemetry is not an operator command and needs no ACK. */
+        link_tick=received_at;
+        return;
+    }
+#endif
+
     switch (request->command) {
     case WEB_CMD_HEARTBEAT:
         if (request->length != 0U) result = WEB_RESULT_BAD_ARGUMENT;
@@ -419,6 +468,8 @@ static void handle_frame(const WebFrame *request, uint32_t received_at)
     case WEB_CMD_MODE:
         if (request->length != 1U || request->payload[0] > WEB_MODE_MANUAL) {
             result = WEB_RESULT_BAD_ARGUMENT;
+        } else if (request->payload[0] == WEB_MODE_MANUAL && RobotControl_IsAutomatic()) {
+            result = WEB_RESULT_WRONG_MODE;
         } else if ((uint32_t)(now - received_at) >= WEB_LINK_LEASE_MS) {
             result = WEB_RESULT_STALE;
         } else {
@@ -447,7 +498,7 @@ static void handle_frame(const WebFrame *request, uint32_t received_at)
                    (!WEB_LIFT_JOG_ENABLED && next_jog[3] != 0)) {
             result = WEB_RESULT_INTERLOCK;
             stop_idle(WEB_FAULT_INTERLOCK);
-        } else if (mode != WEB_MODE_MANUAL) {
+        } else if (RobotControl_IsAutomatic() || mode != WEB_MODE_MANUAL) {
             result = WEB_RESULT_WRONG_MODE;
         } else if ((uint32_t)(now - received_at) >= WEB_JOG_LEASE_MS) {
             result = WEB_RESULT_STALE;
@@ -499,7 +550,7 @@ static void handle_frame(const WebFrame *request, uint32_t received_at)
     case WEB_CMD_CLAW:
         if (request->length != 1U || request->payload[0] > 1U) {
             result = WEB_RESULT_BAD_ARGUMENT;
-        } else if (mode != WEB_MODE_MANUAL) {
+        } else if (RobotControl_IsAutomatic() || mode != WEB_MODE_MANUAL) {
             result = WEB_RESULT_WRONG_MODE;
         } else if (jog_active || pending_jog_valid) {
             result = WEB_RESULT_INTERLOCK;
@@ -522,7 +573,7 @@ static void handle_frame(const WebFrame *request, uint32_t received_at)
     case WEB_CMD_CLAW_ANGLE:
         if (request->length != 2U || Web_Get16(request->payload) > WEB_CLAW_MAX_ANGLE) {
             result = WEB_RESULT_BAD_ARGUMENT;
-        } else if (mode != WEB_MODE_MANUAL) {
+        } else if (RobotControl_IsAutomatic() || mode != WEB_MODE_MANUAL) {
             result = WEB_RESULT_WRONG_MODE;
         } else if (jog_active || pending_jog_valid || fault != WEB_FAULT_NONE) {
             result = WEB_RESULT_INTERLOCK;
@@ -549,7 +600,7 @@ static void handle_frame(const WebFrame *request, uint32_t received_at)
             Web_Get16(request->payload + 4) > WEB_GIMBAL_MAX_ANGLE ||
             Web_Get16(request->payload + 6) > WEB_GIMBAL_MAX_ANGLE) {
             result = WEB_RESULT_BAD_ARGUMENT;
-        } else if (mode != WEB_MODE_IDLE && mode != WEB_MODE_MANUAL) {
+        } else if (RobotControl_IsAutomatic() || (mode != WEB_MODE_IDLE && mode != WEB_MODE_MANUAL)) {
             result = WEB_RESULT_WRONG_MODE;
         } else if (jog_active || pending_jog_valid || fault != WEB_FAULT_NONE) {
             result = WEB_RESULT_INTERLOCK;
@@ -568,7 +619,7 @@ static void handle_frame(const WebFrame *request, uint32_t received_at)
         if (request->length != 2U ||
             Web_Get16(request->payload) > WEB_GIMBAL_MAX_ANGLE) {
             result = WEB_RESULT_BAD_ARGUMENT;
-        } else if (mode != WEB_MODE_MANUAL) {
+        } else if (RobotControl_IsAutomatic() || mode != WEB_MODE_MANUAL) {
             result = WEB_RESULT_WRONG_MODE;
         } else if (jog_active || pending_jog_valid) {
             result = WEB_RESULT_INTERLOCK;
@@ -592,7 +643,7 @@ static void handle_frame(const WebFrame *request, uint32_t received_at)
         if (request->length != 2U ||
             Web_Get16(request->payload) > WEB_TRAY_MAX_ANGLE) {
             result = WEB_RESULT_BAD_ARGUMENT;
-        } else if (mode != WEB_MODE_MANUAL) {
+        } else if (RobotControl_IsAutomatic() || mode != WEB_MODE_MANUAL) {
             result = WEB_RESULT_WRONG_MODE;
         } else if (jog_active || pending_jog_valid || manual_lift_active ||
                    fault != WEB_FAULT_NONE) {
@@ -613,35 +664,43 @@ static void handle_frame(const WebFrame *request, uint32_t received_at)
         break;
     case WEB_CMD_TASK:
         if (request->length != WEB_TASK_PLAN_SIZE) result = WEB_RESULT_BAD_ARGUMENT;
-        else if (mode == WEB_MODE_AUTO || Logistics_IsRunning()) result = WEB_RESULT_WRONG_MODE;
+        else if (RobotControl_IsAutomatic()) result = WEB_RESULT_WRONG_MODE;
         else if ((uint32_t)(now-received_at) >= WEB_LINK_LEASE_MS) result = WEB_RESULT_STALE;
         else if (fault != WEB_FAULT_NONE || jog_active || pending_jog_valid || manual_lift_active)
             result = WEB_RESULT_INTERLOCK;
-        else if (!Logistics_SetPlan(request->payload, request->length)) result = WEB_RESULT_BAD_ARGUMENT;
-        else link_tick = received_at;
+        else {
+            result = RobotControl_SetPlan(request->payload, request->length);
+            if (result == WEB_RESULT_OK) link_tick = received_at;
+        }
         break;
     case WEB_CMD_START:
-        if (request->length!=(1U+WEB_TASK_PLAN_SIZE) || request->payload[0]!=1U) result=WEB_RESULT_BAD_ARGUMENT;
-        else if (mode==WEB_MODE_AUTO || jog_active || pending_jog_valid) result=WEB_RESULT_WRONG_MODE;
-        else if ((uint32_t)(now-received_at)>=WEB_LINK_LEASE_MS) result=WEB_RESULT_STALE;
-        else if (fault!=WEB_FAULT_NONE) result=WEB_RESULT_INTERLOCK;
-        else if (!Logistics_PlanMatches(request->payload+1U, WEB_TASK_PLAN_SIZE)) result=WEB_RESULT_INTERLOCK;
+        if (request->length != (1U + WEB_TASK_PLAN_SIZE) || request->payload[0] != 1U)
+            result = WEB_RESULT_BAD_ARGUMENT;
+        else if (RobotControl_IsAutomatic() || jog_active || pending_jog_valid || manual_lift_active)
+            result = WEB_RESULT_WRONG_MODE;
+        else if ((uint32_t)(now-received_at) >= WEB_LINK_LEASE_MS) result = WEB_RESULT_STALE;
+        else if (fault != WEB_FAULT_NONE) result = WEB_RESULT_INTERLOCK;
         else {
-            /* Automatic preparation may command YunTai even if start fails. */
-            gimbal_target=WEB_GIMBAL_UNKNOWN_ANGLE;
-            claw_angle_target=WEB_GIMBAL_UNKNOWN_ANGLE;
-            tray_target=WEB_TRAY_UNKNOWN_ANGLE;
-            if (!stop_all() || !Logistics_Start()) result=WEB_RESULT_INTERLOCK;
-            else {
-                mode=WEB_MODE_AUTO;
-                claw_target=2U; gimbal_target=WEB_GIMBAL_UNKNOWN_ANGLE;
+            result = RobotControl_Start(request->payload + 1U, WEB_TASK_PLAN_SIZE);
+            if (result == WEB_RESULT_OK) {
+                mode = WEB_MODE_IDLE;
+                manual_lift_latched = 0U;
             }
-            link_tick=received_at;
+            /* Preparation may change servo targets even when startup fails. */
+            gimbal_target = WEB_GIMBAL_UNKNOWN_ANGLE;
+            claw_angle_target = WEB_GIMBAL_UNKNOWN_ANGLE;
+            tray_target = WEB_TRAY_UNKNOWN_ANGLE;
+            claw_target = 2U;
+            link_tick = received_at;
         }
         break;
     case WEB_CMD_PAUSE:
-        if (request->length!=0U) result=WEB_RESULT_BAD_ARGUMENT;
-        else { stop_idle(WEB_FAULT_NONE); link_tick=received_at; }
+        if (request->length != 0U) result = WEB_RESULT_BAD_ARGUMENT;
+        else {
+            result = RobotControl_Stop();
+            stop_idle(WEB_FAULT_NONE);
+            link_tick = received_at;
+        }
         break;
     default:
         result = WEB_RESULT_UNSUPPORTED;
@@ -730,7 +789,6 @@ static void handle_rx_fault(void)
 
 void WebControl_Init(void)
 {
-    Logistics_Init();
     rx_head = 0U;
     rx_tail = 0U;
     rx_faults = 0U;
@@ -740,12 +798,14 @@ void WebControl_Init(void)
     fault = WEB_FAULT_NONE;
     claw_target = 2U;
     claw_angle_target = WEB_GIMBAL_UNKNOWN_ANGLE;
-    (void)Duoji_SetPresets(GRAB, OPEN, IN, OUT);
     motion_dirty = 0U;
     gimbal_target = WEB_GIMBAL_UNKNOWN_ANGLE;
     tray_target = WEB_TRAY_UNKNOWN_ANGLE;
     pending_jog_valid = 0U;
     status_tick = motor_tick = HAL_GetTick();
+#if LOG_EXTERNAL_TABLE_ENABLED
+    table_request_tick=HAL_GetTick();
+#endif
     stop_idle(WEB_FAULT_NONE);
     if (HAL_UART_Receive_IT(&huart4, &rx_byte, 1U) != HAL_OK)
         rx_faults |= RX_FAULT_UART;
@@ -783,10 +843,6 @@ uint8_t WebControl_Task(void)
     uint8_t motion_ok;
 
     if (rx_faults) handle_rx_fault();
-    if (start || zero || vision_follow_enable) {
-        stop_idle(WEB_FAULT_INTERLOCK);
-        discard_rx();
-    }
     check_leases(HAL_GetTick());
     check_manual_lift();
     while (budget-- && rx_tail != rx_head && !rx_faults) {
@@ -800,7 +856,7 @@ uint8_t WebControl_Task(void)
     if (rx_faults) handle_rx_fault();
     now = HAL_GetTick();
     check_leases(now);
-    if (jog_active && motion_dirty && mode == WEB_MODE_MANUAL &&
+    if (!RobotControl_IsAutomatic() && jog_active && motion_dirty && mode == WEB_MODE_MANUAL &&
         (uint32_t)(now - motor_tick) >= WEB_MOTOR_PERIOD_MS) {
         motor_tick = now;
         motion_ok = apply_motion();
@@ -811,19 +867,14 @@ uint8_t WebControl_Task(void)
         finish_jog_ack(motion_ok && jog_active ? WEB_RESULT_OK : WEB_RESULT_INTERLOCK);
     }
     if (pending_jog_valid && !jog_active) finish_jog_ack(WEB_RESULT_INTERLOCK);
-    Logistics_Task();
     check_manual_lift();
-    if (mode==WEB_MODE_AUTO) {
-        if (logistics_state==LOG_FAULT) stop_idle(WEB_FAULT_AUTOMATIC);
-        else if (logistics_state==LOG_DONE) mode=WEB_MODE_IDLE;
-    }
-    /* Recheck after bounded motor I/O and the automatic state-machine step. */
+    /* Recheck after bounded manual motor I/O. Automatic control has its own task. */
     if (rx_faults) handle_rx_fault();
     check_leases(HAL_GetTick());
+#if LOG_EXTERNAL_TABLE_ENABLED
+    send_table_request(HAL_GetTick());
+#endif
     send_status(HAL_GetTick());
-    start = 0;
-    zero = 0;
-    vision_follow_enable = 0U;
     return 1U;
 }
 

@@ -48,6 +48,33 @@ void ZhuanPan(float) {}
 #include "../../Core/Src/logistics_task.c"
 #include "../../Core/Src/web_control.c"
 
+void RobotControl_ReadStatus(RobotStatus *status) {
+    status->state=logistics_state; status->drop_index=logistics_drop_index;
+    status->error=logistics_error; status->running=Logistics_IsRunning();
+    status->plan_ready=Logistics_PlanReady(); status->x_m=logistics_x_m; status->y_m=logistics_y_m;
+}
+uint8_t RobotControl_IsAutomatic(void) { return Logistics_IsRunning(); }
+uint8_t RobotControl_SetPlan(const uint8_t *items,uint8_t length) {
+    return Logistics_SetPlan(items,length) ? WEB_RESULT_OK : WEB_RESULT_BAD_ARGUMENT;
+}
+uint8_t RobotControl_Start(const uint8_t *items,uint8_t length) {
+    if (!Logistics_PlanMatches(items,length)) return WEB_RESULT_INTERLOCK;
+    return Logistics_Start() ? WEB_RESULT_OK : WEB_RESULT_INTERLOCK;
+}
+uint8_t RobotControl_Stop(void) { Logistics_Cancel(); return WEB_RESULT_OK; }
+uint8_t RobotControl_GetLiftFeedback(int64_t *count,uint32_t *tick,uint32_t *serial) {
+    return Logistics_GetLiftFeedback(count,tick,serial);
+}
+void MotorBus_Begin(void) {}
+void MotorBus_End(void) {}
+uint8_t MotorBus_Transmit(const uint8_t *data,uint16_t size,uint32_t gap_ms) {
+    uint8_t ok=HAL_UART_Transmit(&huart1,(uint8_t *)data,size,10U)==HAL_OK;
+    HAL_Delay(gap_ms);
+    return ok;
+}
+/* Simulate two independently scheduled tasks. */
+static void service_tasks(void) { Logistics_Task(); WebControl_Task(); }
+
 HAL_StatusTypeDef JiaZhua_SetAngle(uint16_t) { return HAL_OK; }
 HAL_StatusTypeDef Tray_SetAngle(uint16_t) { ++tray_commands; return HAL_OK; }
 HAL_StatusTypeDef Duoji_SetPresets(uint16_t,uint16_t,uint16_t,uint16_t) { return HAL_OK; }
@@ -147,7 +174,7 @@ static void request(uint8_t command,uint16_t sequence,const int8_t *payload=NULL
     for (unsigned i=0;i<count;++i) {
         *receiver=wire[i]; WebControl_RxCompleteISR(); advance(1U);
     }
-    WebControl_Task();
+    service_tasks();
 }
 static void reset(bool initial_feedback=true) {
     clock_ms=1U; start=zero=0; vision_follow_enable=0;
@@ -155,13 +182,13 @@ static void reset(bool initial_feedback=true) {
     lift_pending=lift_moving=false; lift_goal=lift_requested_rpm=0; last_lift_pulses=0;
     lift_rate_scale=1.0;
     memset(motor_position,0,sizeof(motor_position)); memset(motor_rpm,0,sizeof(motor_rpm));
-    WebControl_Init(); nonzero_lift_commands=stop_lift_commands=0;
+    Logistics_Init(); WebControl_Init(); nonzero_lift_commands=stop_lift_commands=0;
     tray_commands=0U;
     replies.clear();
     request(WEB_CMD_HELLO,1U);
     if (initial_feedback) {
         /* Poll all five axes, exercising the real receive parser. */
-        for (unsigned i=0;i<18;++i) { advance(10U); WebControl_Task(); }
+        for (unsigned i=0;i<18;++i) { advance(10U); service_tasks(); }
     }
     int8_t manual=WEB_MODE_MANUAL; request(WEB_CMD_MODE,2U,&manual,1U);
     assert(mode==WEB_MODE_MANUAL);
@@ -169,7 +196,7 @@ static void reset(bool initial_feedback=true) {
 static void jog_lift(int8_t direction,uint16_t sequence) {
     const int8_t command[4]={0,0,0,direction};
     request(WEB_CMD_JOG,sequence,command,4U);
-    if (motion_dirty) { advance(WEB_MOTOR_PERIOD_MS); WebControl_Task(); }
+    if (motion_dirty) { advance(WEB_MOTOR_PERIOD_MS); service_tasks(); }
 }
 static void hold(unsigned duration_ms,int8_t direction=1) {
     uint32_t began=clock_ms; uint16_t sequence=4U;
@@ -202,11 +229,11 @@ static void tests(void) {
     request(WEB_CMD_STOP,4U); assert(mode==WEB_MODE_IDLE && motor_rpm[4]==0);
 
     reset(); jog_lift(1,3U); uint32_t lease=jog_tick;
-    clock_ms=lease+WEB_JOG_LEASE_MS; WebControl_Task();
+    clock_ms=lease+WEB_JOG_LEASE_MS; service_tasks();
     assert(mode==WEB_MODE_IDLE && !jog_active && motor_rpm[4]==0 && fault==WEB_FAULT_JOG_TIMEOUT);
 
     reset(); jog_lift(1,3U); lease=link_tick;
-    clock_ms=lease+WEB_LINK_LEASE_MS; WebControl_Task();
+    clock_ms=lease+WEB_LINK_LEASE_MS; service_tasks();
     assert(mode==WEB_MODE_IDLE && !session_valid && motor_rpm[4]==0 && fault==WEB_FAULT_LINK_TIMEOUT);
 
     reset(); jammed=true; jog_lift(1,3U); hold(3000U);
@@ -243,7 +270,7 @@ static void tests(void) {
     advance(WEB_MOTOR_PERIOD_MS);
     feedback_available=false;
     encoders[4].tick=clock_ms-WEB_LIFT_FEEDBACK_TIMEOUT_MS-1U;
-    WebControl_Task();
+    service_tasks();
     assert(nonzero_lift_commands==0U && !jog_active && result()==WEB_RESULT_INTERLOCK);
 
     reset(); motor_uart_ok=false; jog_lift(1,3U);

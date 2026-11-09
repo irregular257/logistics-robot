@@ -19,7 +19,8 @@ HAL_StatusTypeDef Duoji_SetPresets(uint16_t claw_close, uint16_t claw_open,
     next.claw_open = claw_open;
     next.gimbal_in = gimbal_in;
     next.gimbal_out = gimbal_out;
-    /* Called by the main-loop controller; validate all four before updating. */
+    /* Web calibration is accepted only while automatic control is idle.
+     * Validate all four values before publishing the new presets. */
     presets = next;
     return HAL_OK;
 }

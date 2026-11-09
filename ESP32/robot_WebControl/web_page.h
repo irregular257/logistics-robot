@@ -29,7 +29,7 @@ static const char WEB_PAGE[] PROGMEM = R"HTML(<!doctype html>
       <button id="manual" type="button" disabled>启用手动</button>
       <button id="release" type="button" disabled>退出控制</button>
     </div>
-    <button id="stop" class="stop" type="button">停止控制</button>
+    <button id="stop" class="stop" type="button">停止全部运动</button>
     <p class="section-hint">停止底盘、升降和自动任务；舵机保持最后下发的目标角度。</p>
     <p class="ack" id="ack">等待设备状态</p>
   </section>
@@ -95,12 +95,13 @@ static const char WEB_PAGE[] PROGMEM = R"HTML(<!doctype html>
   <section class="panel" aria-label="自动搬运">
     <h2>200 × 200 cm 自动搬运</h2>
     <p class="section-hint">左下依次抓取三件，装入转盘三个储料槽 → 左上投放第一件 → 右上投放第二件 → 右下投放第三件 → 返回起点。三件装齐后再出发。</p>
+    <p class="section-hint">主控接受启动后独立执行。关闭网页或 Wi-Fi 断开时自动任务继续，点击“停止自动任务”或“停止全部运动”可终止。启用外置供料转盘时，转盘通信中断会停止装载。</p>
     <p class="section-hint">启动前：车中心在 (30,30) cm，车头朝场地上方，升降在已标定的搬运高度。停止后需重新摆放和恢复升降高度。</p>
     <label class="section-hint" style="display:block"><input id="positioned" type="checkbox"> 已确认起点、方向和搬运高度</label>
     <div class="controls"><button id="autoStart" class="primary" type="button" disabled>启动三件搬运</button><button id="autoCancel" type="button" disabled>停止自动任务</button></div>
     <p class="section-hint" id="autoStatus" role="status" aria-live="polite">等待自动任务状态</p>
   </section>
-  <footer>停止按钮始终可用。刷新页面后不会恢复控制或运动。</footer>
+  <footer>停止按钮始终可用。刷新页面后需重新申请手动控制，自动任务继续由主控执行。</footer>
 </main>
 <script>
 'use strict';
@@ -219,8 +220,9 @@ static const char WEB_PAGE[] PROGMEM = R"HTML(<!doctype html>
     $('taskStatus').textContent = !available || !state.online ? '等待主控连接。' : !state.taskSupported ? '请更新主控固件以接收抓取顺序。' : state.taskPending ? '等待主控确认抓取顺序。' : taskMatches() ? '主控已确认：' + planText(state.taskPlan) : '当前选择尚未确认，请发送抓取顺序。';
     $('autoStart').disabled = !token || !available || !state.online || !state.autoSupported || !state.taskSupported || !taskMatches() || !stopped() || faulty() || state.mode===2 || state.pending || commandBusy || !!press || !!zeroFlight || document.hidden || !$('positioned').checked;
     $('autoCancel').disabled = !token || !available || state.mode!==2 || commandBusy || document.hidden;
-    const steps=['待机','准备装载','视觉对齐','下降抓取','夹紧物料','抬起物料','收回至储料盘','前往投放区','展开夹爪','下降投放','松开投放','抬起夹爪','返回起点','三件完成','已停止','任务故障','下降存料','松开存料','抬起空夹爪','伸出准备下一件','回到取料点','转盘对准待投物料','下降取出物料','夹紧盘中物料','抬起盘中物料','收回准备行驶'];
-    $('autoStatus').textContent = available && state.autoSupported ? (steps[state.autoState] || '状态未知') + ' · 当前第 ' + (state.autoDrop+1) + ' 件 · 估计位置 (' + state.autoXcm + ', ' + state.autoYcm + ') cm' + (state.autoError ? ' · 原因 ' + state.autoError : '') : '等待自动任务固件';
+    const steps=['待机','准备装载','视觉对齐','下降抓取','夹紧物料','抬起物料','收回至储料盘','前往投放区','展开夹爪','下降投放','松开投放','抬起夹爪','返回起点','三件完成','已停止','任务故障','下降存料','松开存料','抬起空夹爪','伸出准备下一件','回到取料点','转盘对准待投物料','下降取出物料','夹紧盘中物料','抬起盘中物料','收回准备行驶','等待供料转盘到位','识别供料物料','等待供料转盘锁定','等待转盘确认取料'];
+    const tableErrors={12:'供料转盘通信失效，请检查两端电源和连接',13:'供料转盘未保持锁定，请复位并重新对位',14:'供料转盘等待超时，请检查目标物料和识别'};
+    $('autoStatus').textContent = available && state.autoSupported ? (steps[state.autoState] || '状态未知') + ' · 当前第 ' + (state.autoDrop+1) + ' 件 · 估计位置 (' + state.autoXcm + ', ' + state.autoYcm + ') cm' + (state.autoError ? ' · ' + (tableErrors[state.autoError] || '原因 ' + state.autoError) : '') : '等待自动任务固件';
     if (!available) $('ack').textContent = '等待设备状态';
     else if (actuatorPending) $('ack').textContent = '等待主控确认' + actuatorPending.name + '指令';
     else if (state.pending || modeRequestedAt) $('ack').textContent = '等待主控确认';
@@ -255,7 +257,7 @@ static const char WEB_PAGE[] PROGMEM = R"HTML(<!doctype html>
       }
       return result;
     } catch (error) {
-      if (timedOut) throw new Error('连接超时，控制已停止，请重新申请');
+      if (timedOut) throw new Error('连接超时，手动控制已释放，请重新连接');
       if (error.name === 'AbortError') throw error;
       throw new Error(error.message || '连接失败，请检查设备热点');
     } finally {
@@ -292,13 +294,14 @@ static const char WEB_PAGE[] PROGMEM = R"HTML(<!doctype html>
     if (!options.always && !token && !claiming && !press) return;
     forgetControl();
     const stoppedEpoch = epoch;
+    const route = options.stopAll ? '/api/stop' : '/api/manual-release';
     notice(message, !!options.error);
     if (options.beacon && navigator.sendBeacon) {
       const body = new Blob([''], { type: 'application/x-www-form-urlencoded' });
-      if (navigator.sendBeacon('/api/stop', body)) return;
+      if (navigator.sendBeacon(route, body)) return;
     }
-    api('/api/stop', { keepalive: !!options.beacon }).catch(() => {
-      if (epoch === stoppedEpoch) notice('停止请求未确认。请检查设备连接；需要重新申请控制。', true);
+    api(route, { keepalive: !!options.beacon }).catch(() => {
+      if (epoch === stoppedEpoch) notice(options.stopAll ? '停止请求未确认，请检查设备连接。' : '手动控制释放请求未确认，请重新连接查看主控状态。', true);
     });
   }
 
@@ -370,11 +373,11 @@ static const char WEB_PAGE[] PROGMEM = R"HTML(<!doctype html>
         return;
       }
       if (token && (!state.online || faulty())) {
-        safetyStop(!state.online ? '主控离线，控制已停止' : (faultMessages[state.fault] || '设备出现故障，控制已停止'), { error: true });
+        safetyStop(!state.online ? '主控离线，手动控制已释放' : (faultMessages[state.fault] || '设备出现故障，手动控制已释放'), { error: true });
         return;
       }
       if (press && !canAct()) {
-        safetyStop('设备已退出可操作状态，控制已停止', { error: true });
+        safetyStop('设备已退出可操作状态，手动控制已释放', { error: true });
         return;
       }
       if (actuatorPending) {
@@ -392,7 +395,7 @@ static const char WEB_PAGE[] PROGMEM = R"HTML(<!doctype html>
           else if (pending.command === 12) notice('主控已接受' + pending.target + '。' + (state.presetsSaved ? '预设已保存，手动和自动动作使用新角度。' : '请查看下方保存状态；预设保存不移动舵机。'));
           else notice('主控已接受' + pending.target + '。若仍不动作，请检查舵机供电和信号接线；当前没有舵机位置反馈。');
         } else if (Date.now() - pending.sentAt >= 1500) {
-          safetyStop(pending.name + '指令没有收到主控确认，控制已停止，请检查串口和主控固件。', { error: true });
+          safetyStop(pending.name + '指令没有收到主控确认，请重新连接查看执行状态。手动控制已释放。', { error: true });
           return;
         }
       }
@@ -558,12 +561,12 @@ static const char WEB_PAGE[] PROGMEM = R"HTML(<!doctype html>
   });
   window.addEventListener('pointerup', endPress);
   window.addEventListener('pointercancel', endPress);
-  window.addEventListener('blur', () => safetyStop('页面失去焦点，控制已停止，请重新申请'));
+  window.addEventListener('blur', () => safetyStop('页面失去焦点，手动控制已释放，请重新申请'));
   document.addEventListener('visibilitychange', () => {
-    if (document.hidden) safetyStop('页面进入后台，控制已停止，请重新申请', { beacon: true });
+    if (document.hidden) safetyStop('页面进入后台，手动控制已释放，请重新申请', { beacon: true });
     else { render(); pollStatus(); }
   });
-  window.addEventListener('pagehide', () => safetyStop('页面已关闭，控制已停止', { beacon: true }));
+  window.addEventListener('pagehide', () => safetyStop('页面已关闭，手动控制已释放', { beacon: true }));
   $('claim').addEventListener('click', claimControl);
   $('manual').addEventListener('click', () => {
     if (!$('manual').disabled) controlledCommand('/api/mode', { value: 1 }, '已发送启用手动，等待主控确认。');
@@ -578,7 +581,7 @@ static const char WEB_PAGE[] PROGMEM = R"HTML(<!doctype html>
   $('autoCancel').addEventListener('click',()=>{
     if (!$('autoCancel').disabled) controlledCommand('/api/pause',{},'已请求停止自动任务；再次启动前恢复起点和升降高度。');
   });
-  $('stop').addEventListener('click', () => safetyStop('已请求停止并退出手动。再次操作需要重新申请。', { always: true }));
+  $('stop').addEventListener('click', () => safetyStop('已请求停止全部运动。再次操作需要重新申请。', { always: true, stopAll: true }));
   $('clawClose').addEventListener('click', () => {
     if (!$('clawClose').disabled) controlledCommand('/api/claw', { value: 0 }, '已发送闭合目标，等待主控确认。');
   });

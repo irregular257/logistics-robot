@@ -31,11 +31,16 @@ function page() {
   fs.writeFileSync(path.join(__dirname, 'index.html'), html, 'utf8');
   return html;
 }
-function stop() {
-  Object.assign(state, { armed: false, mode: 0, ownerActive: false, x: 0, y: 0, turn: 0, lift: 0 });
-  if (state.autoState > 0 && state.autoState < 13) state.autoState = 14;
+function releaseManual() {
+  Object.assign(state, { armed: false, ownerActive: false, x: 0, y: 0, turn: 0, lift: 0 });
+  if (state.mode === 1) state.mode = 0;
   token = '';
   clearTimeout(liftTimer); liftLatched = false;
+}
+function stop() {
+  if (state.mode === 2) state.autoState = 14;
+  state.mode = 0;
+  releaseManual();
 }
 const server = http.createServer(async (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
@@ -56,6 +61,7 @@ const server = http.createServer(async (req, res) => {
     if (route === '/api/status') return req.method === 'GET' ? reply({ ...state, mine: !!token && req.headers['x-token'] === token }) : reply({error:'请使用 GET 请求'},405);
     if (route.startsWith('/api/') && req.method !== 'POST') return reply({ error: '请使用 POST 请求' }, 405);
     if (route === '/api/stop') { stop(); return reply({ ok: true }); }
+    if (route === '/api/manual-release') { releaseManual(); return reply({ ok: true }); }
     if (route === '/api/claim') {
       if (token) return reply({ error: '已有预览页面持有控制权' }, 409);
       token = crypto.randomBytes(8).toString('hex');
@@ -80,8 +86,11 @@ const server = http.createServer(async (req, res) => {
     const taskIdle = () => state.stmOnline && !state.fault && state.mode !== 2 && !state.x && !state.y && !state.turn && !state.lift;
     switch (route) {
       case '/api/ping': break;
-      case '/api/release': stop(); break;
-      case '/api/mode': state.mode = 1; state.armed = true; command = 4; break;
+      case '/api/release': releaseManual(); break;
+      case '/api/mode':
+        if (fields.get('value') === '0') { releaseManual(); break; }
+        if (state.mode === 2) return reply({error:'自动任务运行中，请先停止自动任务'},409);
+        state.mode = 1; state.armed = true; command = 4; break;
       case '/api/jog': {
         if (state.mode !== 1 || !state.armed || !state.stmOnline || state.fault) return reply({ error: '请先启用手动并确认主控状态' }, 409);
         const vector = ['x', 'y', 'turn', 'lift'].map(key => Number(fields.get(key)));

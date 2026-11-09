@@ -3,7 +3,7 @@
 
 #include "main.h"
 
-/* Set to 0 to restore the legacy application and VisionFollow_Task. */
+/* Enable the independent web-command task. Automatic control has its own task. */
 #ifndef WEB_CONTROL_ENABLED
 #define WEB_CONTROL_ENABLED 1
 #endif

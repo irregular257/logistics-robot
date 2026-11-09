@@ -35,6 +35,13 @@ static uint8_t wrong_color, wrong_shape;
 uint32_t HAL_GetTick(void) { return clock_ms; }
 void HAL_Delay(uint32_t);
 HAL_StatusTypeDef HAL_UART_Transmit(UART_HandleTypeDef *,uint8_t *,uint16_t,uint32_t);
+void MotorBus_Begin(void) {}
+void MotorBus_End(void) {}
+uint8_t MotorBus_Transmit(const uint8_t *data, uint16_t size, uint32_t gap_ms) {
+    uint8_t ok = HAL_UART_Transmit(&huart1, (uint8_t *)data, size, 10U) == HAL_OK;
+    HAL_Delay(gap_ms);
+    return ok;
+}
 HAL_StatusTypeDef HAL_TIM_PWM_Start(TIM_HandleTypeDef *,uint32_t) { return HAL_OK; }
 HAL_StatusTypeDef Duoji_StartPWM(uint32_t) { return HAL_OK; }
 void ZhuaZi(uint16_t);
